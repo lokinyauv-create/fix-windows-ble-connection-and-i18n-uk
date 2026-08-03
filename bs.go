@@ -214,7 +214,7 @@ func (lv *LighthouseV2) ScanCharacteristics() bool {
 
 	lv.mac = lv.p.Address.String()
 	go lv.StartCaching()
-	return lv.modeCharacteristic != nil && lv.powerStateCharacteristic != nil
+	return lv.ValidLighthouse
 }
 
 func (lv *LighthouseV2) GetChannel() int {
@@ -270,7 +270,22 @@ func (lv *LighthouseV2) SetPowerState(state byte) {
 		log.Printf("Failed to write bytes on lighthouse, reconnecting...; lighthouse=%s, err=%+v;\n", lv.Id, err)
 
 		lv.Reconnect()
+		return
 	}
+
+	// Base stations that support neither reading nor notifying on the power
+	// characteristic would otherwise stay at -1 forever, so track what we just
+	// asked for - it is the only power state information available on them.
+	switch state {
+	case 0x00:
+		lv.CachedPowerState = BS_POWERSTATE_SLEEP
+	case 0x01:
+		lv.CachedPowerState = BS_POWERSTATE_AWAKE
+	case 0x02:
+		lv.CachedPowerState = BS_POWERSTATE_STAND_BY
+	}
+
+	WEBSOCKET_BROADCAST.Broadcast(prepareIdWithFieldPacket(lv.Id, "lighthouse.update.power_state", "power_state", lv.CachedPowerState))
 }
 
 func (lv *LighthouseV2) Identitfy() {
@@ -353,9 +368,13 @@ func (lv *LighthouseV2) readPowerState() int {
 	_, err := lv.powerStateCharacteristic.Read(data)
 
 	if err != nil {
+		// On Windows the power characteristic often doesn't advertise the read
+		// property, so Read fails with "read not supported". That is not a
+		// broken connection - reconnecting here tears down a working session,
+		// nils the characteristics and loops forever. The power state still
+		// arrives through the notifications set up in StartCaching.
 		log.Printf("Failed to read state on %s: %+v\n", lv.Id, err)
-		lv.Reconnect()
-		return lv.readPowerState()
+		return lv.CachedPowerState
 	}
 
 	lv.CachedPowerState = int(data[0])
@@ -371,9 +390,10 @@ func (lv *LighthouseV2) readChannel() int {
 	_, err := lv.modeCharacteristic.Read(data)
 
 	if err != nil {
+		// Same reasoning as readPowerState: a failed read is not a reason to
+		// drop an otherwise healthy connection.
 		log.Printf("Failed to read channel on %s: %+v\n", lv.Id, err)
-		lv.Reconnect()
-		return lv.readChannel()
+		return lv.CachedChannel
 	}
 
 	lv.CachedChannel = int(data[0])
