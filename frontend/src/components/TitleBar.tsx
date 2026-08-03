@@ -41,31 +41,40 @@ export function TitleBar() {
             if (!config) return;
             if (!config.is_steamvr_managed) return;
 
-            if (steamVRLaunched && !previousSteamVRState) {
+            // Only react to an actual SteamVR transition. Without this the
+            // effect also fires on mount and puts the base stations to sleep
+            // right after the app starts.
+            if (steamVRLaunched === previousSteamVRState) return;
+
+            setPreviousSteamVRState(steamVRLaunched);
+
+            if (steamVRLaunched) {
                 console.log("Waking up")
                 await bulkUpdate("awake", 2);
-                setPreviousSteamVRState(steamVRLaunched);
                 return;
             }
 
             console.log("Putting in sleep mode")
             await bulkUpdate("sleep", 4);
-            setPreviousSteamVRState(steamVRLaunched);
         })()
     }, [steamVRLaunched]);
 
   
     const toggleAllBaseStations = async () => {
-        let status = [...lighthouses.map(c => c.power_state)][0];
+        // Base stations that don't support reading their power state report -1.
+        // Treat anything that isn't explicitly awake as "asleep" so the button
+        // wakes them up instead of sending another sleep command.
+        const anyAwake = lighthouses.some(c => c.power_state === 9 || c.power_state === 11);
 
-        if (!status) {
+        // Note: previousSteamVRState tracks SteamVR only. Overwriting it here
+        // made a manual toggle flip the automation, so that starting SteamVR
+        // afterwards sent "sleep" instead of "awake".
+        if (!anyAwake) {
             console.log("Waking up everything");
-            setPreviousSteamVRState(false);
             return await bulkUpdate("awake");
         }
 
         console.log("Putting all base station in sleep mode");
-        setPreviousSteamVRState(true);
         await bulkUpdate("sleep");
     }
 
