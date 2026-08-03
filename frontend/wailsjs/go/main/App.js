@@ -18,6 +18,10 @@ export function CreateGroup(arg1, arg2) {
   return window['go']['main']['App']['CreateGroup'](arg1, arg2);
 }
 
+export function EnableBluetooth() {
+  return window['go']['main']['App']['EnableBluetooth']();
+}
+
 export function ForceUpdate() {
   return window['go']['main']['App']['ForceUpdate']();
 }

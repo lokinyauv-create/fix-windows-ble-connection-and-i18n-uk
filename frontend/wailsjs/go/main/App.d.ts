@@ -10,6 +10,8 @@ export function ChangeBaseStationPowerStatus(arg1:string,arg2:string):Promise<st
 
 export function CreateGroup(arg1:string,arg2:Array<string>):Promise<string>;
 
+export function EnableBluetooth():Promise<boolean>;
+
 export function ForceUpdate():Promise<void>;
 
 export function ForgetBaseStation(arg1:string):Promise<void>;

@@ -84,7 +84,13 @@ func (a *App) startup(ctx context.Context) {
 	}()
 
 	config = GetConfiguration()
-	a.InitBluetooth()
+
+	// Only bring the adapter up here. Starting an advertisement scan at this
+	// point (as InitBluetooth does) makes the radio scan while
+	// preloadBaseStations is enumerating GATT services on the known base
+	// stations, and on Windows that makes service discovery hang forever.
+	// Scanning is started on demand instead - see StartScanFor10Seconds.
+	a.EnableBluetooth()
 
 	go a.preloadBaseStations()
 
@@ -337,20 +343,24 @@ func (a *App) StartScanFor10Seconds() {
 	}))
 }
 
-func (a *App) InitBluetooth() bool {
+// EnableBluetooth brings up the adapter without starting a scan.
+func (a *App) EnableBluetooth() bool {
 
 	if a.bluetoothInitFinished {
 		return true
 	}
 
 	if err := adapter.Enable(); err != nil {
+		log.Printf("Failed to enable bluetooth adapter: %+v\n", err)
 		return false
 	}
 
-	go a.StartScanFor10Seconds()
-
 	a.bluetoothInitFinished = true
 	return true
+}
+
+func (a *App) InitBluetooth() bool {
+	return a.EnableBluetooth()
 }
 
 func ScanCallback(app *App, a *bluetooth.Adapter, sr bluetooth.ScanResult) {
