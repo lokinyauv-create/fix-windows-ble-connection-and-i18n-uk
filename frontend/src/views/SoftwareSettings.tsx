@@ -178,7 +178,8 @@ export function SoftwareSettings() {
                 <span>
                     <Trans i18nKey={"Made By"}>
                         Made by <button className='text-[#1D81FF] hover:text-[#66AAFF] duration-150 cursor-pointer' onClick={() => {
-                            // window.runtime.BrowserOpenURL("https://lisek.cc")
+                            //@ts-ignore
+                            window.runtime.BrowserOpenURL("https://lisek.cc")
                         }}>Alumi</button>
                     </Trans>
                 </span>
@@ -186,14 +187,16 @@ export function SoftwareSettings() {
                 <span>
                     <Trans i18nKey={"Design By"}>
                         Design by <button className='text-[#1D81FF] hover:text-[#66AAFF] duration-150 cursor-pointer' onClick={() => {
-                            // window.runtime.BrowserOpenURL("https://github.com/klonerovsky183")
+                            //@ts-ignore
+                            window.runtime.BrowserOpenURL("https://github.com/klonerovsky183")
                         }}>Klonerovsky</button>
                     </Trans>
                 </span>
 
                 <span>
                     <button className='text-[#1D81FF] hover:text-[#66AAFF] duration-150 cursor-pointer' onClick={() => {
-                        //  window.runtime.BrowserOpenURL("https://github.com/DHCPCD9/go-steamvr-lighthouse-manager")} 
+                        //@ts-ignore
+                        window.runtime.BrowserOpenURL("https://github.com/DHCPCD9/go-steamvr-lighthouse-manager")
                     }}>{t("Source code")}</button>
                 </span>
             </div>
