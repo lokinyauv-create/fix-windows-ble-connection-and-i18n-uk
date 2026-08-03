@@ -5,6 +5,7 @@ import type { LighthouseGroup } from "@src/lib/types";
 import { useTranslation } from "react-i18next";
 import { AnimatePresence, motion } from "framer-motion";
 import { CirclePower, Settings } from "lucide-preact";
+import { ChangeBaseStationPowerStatus } from "@src/lib/native/index";
 export function BaseStationGroup({ group, id }: { id: string, group: LighthouseGroup }) {
 
     const baseStations = useGroupedLighthouses(id);
@@ -12,9 +13,16 @@ export function BaseStationGroup({ group, id }: { id: string, group: LighthouseG
     const { t } = useTranslation();
 
 
-    const updatePowerState = async () => {
-        for(const bs of baseStations) {
-            // if (bs.power_state)
+    const updatePowerState = async (e: MouseEvent) => {
+        e.stopPropagation();
+
+        // Base stations that don't support reading their power state report -1,
+        // so treat anything that isn't explicitly awake as asleep.
+        const anyAwake = baseStations.some(bs => bs.power_state === 9 || bs.power_state === 11);
+        const mode = anyAwake ? "sleep" : "awake";
+
+        for (const bs of baseStations) {
+            await ChangeBaseStationPowerStatus(bs.id, mode);
         }
     }
 
@@ -40,7 +48,7 @@ export function BaseStationGroup({ group, id }: { id: string, group: LighthouseG
             <AnimatePresence>
 
             <motion.div key={"awoke"}>
-                <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={updatePowerState}>
+                <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={(e) => updatePowerState(e)}>
                    <CirclePower color="#C6C6C6" strokeWidth={2}  />
                 </button>
             </motion.div>
