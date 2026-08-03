@@ -5,6 +5,7 @@ package main
 
 import (
 	"log"
+	"strings"
 	"time"
 
 	"tinygo.org/x/bluetooth"
@@ -79,6 +80,10 @@ func (lv *LighthouseV2) StartCaching() {
 }
 
 func connectToPreloadedBaseStation(bs *LighthouseV2, config BaseStationConfiguration, wakeUp bool, attemp int) {
+	if attemp > 5 {
+		log.Printf("Giving up connecting to base station %s after %d attempts\n", config.Id, attemp)
+		return
+	}
 
 	parsedMac, err := bluetooth.ParseMAC(config.MacAddress)
 
@@ -102,14 +107,62 @@ func connectToPreloadedBaseStation(bs *LighthouseV2, config BaseStationConfigura
 
 	bs.adapter = adapter
 
-	defer conn.Disconnect()
-
 	bs.p = &conn
+	bs.mac = config.MacAddress
 
-	log.Printf("Connected to base station: %s, wake up: %+v\n", config.Id, wakeUp)
+	log.Printf("Connected to base station: %s, wake up: %+v; discovering GATT services...\n", config.Id, wakeUp)
 
-	bs.FindService()
-	bs.ScanCharacteristics()
+	// Discover the service inline instead of going through FindService, which
+	// kicks off a Reconnect() on every failure and turns a single unresponsive
+	// station into a storm of overlapping connection attempts.
+	// GetGattServicesWithCacheModeAsync also has no built-in timeout on Windows
+	// and hangs indefinitely if the device never answers, so bound it here.
+	discoveryDone := make(chan bool, 1)
+	go func() {
+		services, err := conn.DiscoverServices(nil)
+		if err != nil {
+			log.Printf("Failed to discover services on %s: %+v\n", config.Id, err)
+			discoveryDone <- false
+			return
+		}
+
+		var foundService *bluetooth.DeviceService
+		for i := range services {
+			service := &services[i]
+			if strings.ToUpper(service.UUID().String()) == LIGHTHOUSE_SERVICE_UUID {
+				log.Printf("Found lighthouse service on base station %s\n", config.Id)
+				foundService = service
+				break
+			}
+		}
+
+		if foundService == nil {
+			log.Printf("Lighthouse service not found on base station %s\n", config.Id)
+			discoveryDone <- false
+			return
+		}
+
+		bs.service = foundService
+		discoveryDone <- bs.ScanCharacteristics()
+	}()
+
+	select {
+	case ok := <-discoveryDone:
+		if !ok {
+			log.Printf("Discovery failed on %s, retrying (attempt %d)...\n", config.Id, attemp+1)
+			conn.Disconnect()
+			time.Sleep(time.Second)
+			connectToPreloadedBaseStation(bs, config, wakeUp, attemp+1)
+			return
+		}
+		log.Printf("Finished discovering GATT services/characteristics on %s\n", config.Id)
+	case <-time.After(8 * time.Second):
+		log.Printf("Timed out discovering GATT services on %s after 8s, disconnecting and retrying (attempt %d)...\n", config.Id, attemp+1)
+		conn.Disconnect()
+		time.Sleep(time.Second)
+		connectToPreloadedBaseStation(bs, config, wakeUp, attemp+1)
+		return
+	}
 
 	if wakeUp {
 		bs.SetPowerState(byte(0x01))
