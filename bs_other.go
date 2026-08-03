@@ -34,8 +34,6 @@ func connectToPreloadedBaseStation(bs *LighthouseV2, config BaseStationConfigura
 
 	bs.adapter = adapter
 
-	defer conn.Disconnect()
-
 	bs.p = &conn
 
 	log.Printf("Connected to base station: %s, wake up: %+v\n", config.Id, wakeUp)
