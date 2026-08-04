@@ -1,4 +1,4 @@
-import { PowerCircle, SettingsIcon, X, XIcon } from "lucide-preact";
+import { Power, PowerOff, SettingsIcon, X, XIcon } from "lucide-preact";
 import { ChangeBaseStationPowerStatus, UpdateConfigValue } from "@src/lib/native/index";
 import { useContext, useEffect, useState } from "preact/hooks";
 import { AnimatePresence, motion } from 'framer-motion';
@@ -28,12 +28,20 @@ export function TitleBar() {
 
     const { t } = useTranslation();
 
+    // Returns the stations that refused the command rather than reporting them
+    // itself: the manual buttons surface these, while the SteamVR automation
+    // below only logs them - it runs unattended, often with the window hidden,
+    // where a dialog would be stuck behind the tray.
     const bulkUpdate = async (state: "sleep" | "awake", flags: number = 0) => {
-        
+        const failures: string[] = [];
+
         for(const baseStation of lighthouses) {
             if (flags && !((baseStation.managed_flags & flags) > 0)) continue;
-            await ChangeBaseStationPowerStatus(baseStation.id, state);
+            const result = await ChangeBaseStationPowerStatus(baseStation.id, state);
+            if (result != "ok") failures.push(`${baseStation.name}: ${result}`);
         }
+
+        return failures;
     }
 
     useEffect(() => {
@@ -41,32 +49,46 @@ export function TitleBar() {
             if (!config) return;
             if (!config.is_steamvr_managed) return;
 
-            if (steamVRLaunched && !previousSteamVRState) {
+            // Only react to an actual SteamVR transition. Without this the
+            // effect also fires on mount and puts the base stations to sleep
+            // right after the app starts.
+            if (steamVRLaunched === previousSteamVRState) return;
+
+            setPreviousSteamVRState(steamVRLaunched);
+
+            if (steamVRLaunched) {
                 console.log("Waking up")
-                await bulkUpdate("awake", 2);
-                setPreviousSteamVRState(steamVRLaunched);
+                const failures = await bulkUpdate("awake", 2);
+                if (failures.length) console.error("Failed to wake:", failures);
                 return;
             }
 
             console.log("Putting in sleep mode")
-            await bulkUpdate("sleep", 4);
-            setPreviousSteamVRState(steamVRLaunched);
+            const failures = await bulkUpdate("sleep", 4);
+            if (failures.length) console.error("Failed to sleep:", failures);
         })()
     }, [steamVRLaunched]);
 
   
-    const toggleAllBaseStations = async () => {
-        let status = [...lighthouses.map(c => c.power_state)][0];
+    const [powerBusy, setPowerBusy] = useState(false);
 
-        if (!status) {
-            console.log("Waking up everything");
-            setPreviousSteamVRState(false);
-            return await bulkUpdate("awake");
+    // Explicit commands rather than one toggle - the app can't read a station's
+    // power state on Windows, so a toggle would have to guess. See BaseStation.
+    //
+    // Note: this deliberately doesn't touch previousSteamVRState. That tracks
+    // SteamVR only, and writing to it here made a manual press flip the
+    // automation so the next SteamVR launch sent "sleep" instead of "awake".
+    const setAllPower = async (mode: "awake" | "sleep") => {
+        // Held only while the commands are in flight - see BaseStation.
+        if (powerBusy) return;
+        setPowerBusy(true);
+
+        try {
+            const failures = await bulkUpdate(mode);
+            if (failures.length) alert(failures.join("\n"));
+        } finally {
+            setPowerBusy(false);
         }
-
-        console.log("Putting all base station in sleep mode");
-        setPreviousSteamVRState(true);
-        await bulkUpdate("sleep");
     }
 
     const Quit = async () => {
@@ -111,8 +133,11 @@ export function TitleBar() {
 
 
             </AnimatePresence>
-            <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25" onClick={toggleAllBaseStations}>
-                <PowerCircle color="#C6C6C6"/>
+            <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25" onClick={() => setAllPower("awake")} disabled={powerBusy} title={t("Turn on")}>
+                <Power color="#C6C6C6"/>
+            </button>
+            <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25" onClick={() => setAllPower("sleep")} disabled={powerBusy} title={t("Turn off")}>
+                <PowerOff color="#C6C6C6"/>
             </button>
             <button onClick={(c) => route("/settings", true)}>
                 {/* <TitleBarSettingsIcon width={16} height={16} fill="#888888" className={`hover:fill-[#1D81FF] duration-200`} /> */}

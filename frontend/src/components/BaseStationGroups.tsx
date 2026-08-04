@@ -1,10 +1,12 @@
 import { useRouter } from "preact-router";
+import { useState } from "preact/hooks";
 import { GroupedBaseStations } from "../assets/icons/GroupedBaseStations";
 import { useGroupedLighthouses } from "@src/lib/hooks/useGroupedLighthouses";
 import type { LighthouseGroup } from "@src/lib/types";
 import { useTranslation } from "react-i18next";
 import { AnimatePresence, motion } from "framer-motion";
-import { CirclePower, Settings } from "lucide-preact";
+import { Power, PowerOff, Settings } from "lucide-preact";
+import { ChangeBaseStationPowerStatus } from "@src/lib/native/index";
 export function BaseStationGroup({ group, id }: { id: string, group: LighthouseGroup }) {
 
     const baseStations = useGroupedLighthouses(id);
@@ -12,9 +14,27 @@ export function BaseStationGroup({ group, id }: { id: string, group: LighthouseG
     const { t } = useTranslation();
 
 
-    const updatePowerState = async () => {
-        for(const bs of baseStations) {
-            // if (bs.power_state)
+    const [powerBusy, setPowerBusy] = useState(false);
+
+    // Explicit commands rather than one toggle - the app can't read a station's
+    // power state on Windows, so a toggle would have to guess. See BaseStation.
+    const setPower = async (e: MouseEvent, mode: "awake" | "sleep") => {
+        e.stopPropagation();
+
+        // Held only while the commands are in flight - see BaseStation.
+        if (powerBusy) return;
+        setPowerBusy(true);
+
+        try {
+            const failures: string[] = [];
+            for (const bs of baseStations) {
+                const result = await ChangeBaseStationPowerStatus(bs.id, mode);
+                if (result != "ok") failures.push(`${bs.name}: ${result}`);
+            }
+
+            if (failures.length) alert(failures.join("\n"));
+        } finally {
+            setPowerBusy(false);
         }
     }
 
@@ -39,9 +59,12 @@ export function BaseStationGroup({ group, id }: { id: string, group: LighthouseG
         <div className="flex flex-row gap-[8px] [&>*]:flex [&>*]:items-center">
             <AnimatePresence>
 
-            <motion.div key={"awoke"}>
-                <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={updatePowerState}>
-                   <CirclePower color="#C6C6C6" strokeWidth={2}  />
+            <motion.div key={"awoke"} className="flex flex-row gap-[8px]">
+                <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={(e) => setPower(e, "awake")} disabled={powerBusy} title={t("Turn on")}>
+                   <Power color="#C6C6C6" strokeWidth={2}  />
+                </button>
+                <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={(e) => setPower(e, "sleep")} disabled={powerBusy} title={t("Turn off")}>
+                   <PowerOff color="#C6C6C6" strokeWidth={2}  />
                 </button>
             </motion.div>
 

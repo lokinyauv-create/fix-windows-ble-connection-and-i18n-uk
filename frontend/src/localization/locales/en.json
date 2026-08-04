@@ -47,7 +47,9 @@
     "Manage Power (Power on)": "Manage Power (Power on)",
     "Wake up base stations on SteamVR Launch": "Wake up base stations on SteamVR Launch",
     "Manage Power (Power Off)": "Manage Power (Power off)",
-    "Power off base stations on SteamVR Exit": "Power off base stations on SteamVR exit"
+    "Power off base stations on SteamVR Exit": "Power off base stations on SteamVR exit",
+    "Turn on": "Turn on",
+    "Turn off": "Turn off"
     
 
 }

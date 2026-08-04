@@ -1,0 +1,944 @@
+From 7f0d5263578310ddf975768160a5a5c24de8f57e Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Mon, 3 Aug 2026 02:30:28 +0200
+Subject: [PATCH 1/6] fix(ui): fix SteamVR auto power automation being flipped
+ by manual toggle
+
+previousSteamVRState was used both to track the last known SteamVR
+state and as a flag set by the manual power button. Toggling base
+stations by hand overwrote it, so the next SteamVR launch could send
+"sleep" instead of "awake" (or vice versa).
+
+The manual toggle no longer touches previousSteamVRState, and the
+SteamVR effect now only fires on an actual SteamVR state transition -
+previously it also ran on mount and put stations to sleep right after
+the app started.
+
+(cherry picked from commit b9c277509a33ee8ec00548e12099833d3ce1b89e)
+---
+ frontend/src/components/TitleBar.tsx | 25 +++++++++++++++++--------
+ 1 file changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/frontend/src/components/TitleBar.tsx b/frontend/src/components/TitleBar.tsx
+index f286c89..d7ad872 100644
+--- a/frontend/src/components/TitleBar.tsx
++++ b/frontend/src/components/TitleBar.tsx
+@@ -41,31 +41,40 @@ export function TitleBar() {
+             if (!config) return;
+             if (!config.is_steamvr_managed) return;
+ 
+-            if (steamVRLaunched && !previousSteamVRState) {
++            // Only react to an actual SteamVR transition. Without this the
++            // effect also fires on mount and puts the base stations to sleep
++            // right after the app starts.
++            if (steamVRLaunched === previousSteamVRState) return;
++
++            setPreviousSteamVRState(steamVRLaunched);
++
++            if (steamVRLaunched) {
+                 console.log("Waking up")
+                 await bulkUpdate("awake", 2);
+-                setPreviousSteamVRState(steamVRLaunched);
+                 return;
+             }
+ 
+             console.log("Putting in sleep mode")
+             await bulkUpdate("sleep", 4);
+-            setPreviousSteamVRState(steamVRLaunched);
+         })()
+     }, [steamVRLaunched]);
+ 
+   
+     const toggleAllBaseStations = async () => {
+-        let status = [...lighthouses.map(c => c.power_state)][0];
+-
+-        if (!status) {
++        // Base stations that don't support reading their power state report -1.
++        // Treat anything that isn't explicitly awake as "asleep" so the button
++        // wakes them up instead of sending another sleep command.
++        const anyAwake = lighthouses.some(c => c.power_state === 9 || c.power_state === 11);
++
++        // Note: previousSteamVRState tracks SteamVR only. Overwriting it here
++        // made a manual toggle flip the automation, so that starting SteamVR
++        // afterwards sent "sleep" instead of "awake".
++        if (!anyAwake) {
+             console.log("Waking up everything");
+-            setPreviousSteamVRState(false);
+             return await bulkUpdate("awake");
+         }
+ 
+         console.log("Putting all base station in sleep mode");
+-        setPreviousSteamVRState(true);
+         await bulkUpdate("sleep");
+     }
+ 
+-- 
+2.55.0
+
+
+From 3480d767acb8dd01728c5ec994bbead052c22148 Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Mon, 3 Aug 2026 02:30:42 +0200
+Subject: [PATCH 2/6] fix(ui): implement the group power toggle button
+
+updatePowerState on a base station group was an empty loop, so the
+power button on a group row did nothing. Wire it up the same way the
+per-station and "power all" toggles work: wake the group if none of
+its stations are awake, otherwise put it to sleep.
+
+(cherry picked from commit 6477e5d7d392a3e0cb953e415a216ff400692581)
+---
+ frontend/src/components/BaseStationGroups.tsx | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/frontend/src/components/BaseStationGroups.tsx b/frontend/src/components/BaseStationGroups.tsx
+index f59a2c6..8674e4f 100644
+--- a/frontend/src/components/BaseStationGroups.tsx
++++ b/frontend/src/components/BaseStationGroups.tsx
+@@ -5,6 +5,7 @@ import type { LighthouseGroup } from "@src/lib/types";
+ import { useTranslation } from "react-i18next";
+ import { AnimatePresence, motion } from "framer-motion";
+ import { CirclePower, Settings } from "lucide-preact";
++import { ChangeBaseStationPowerStatus } from "@src/lib/native/index";
+ export function BaseStationGroup({ group, id }: { id: string, group: LighthouseGroup }) {
+ 
+     const baseStations = useGroupedLighthouses(id);
+@@ -12,9 +13,16 @@ export function BaseStationGroup({ group, id }: { id: string, group: LighthouseG
+     const { t } = useTranslation();
+ 
+ 
+-    const updatePowerState = async () => {
+-        for(const bs of baseStations) {
+-            // if (bs.power_state)
++    const updatePowerState = async (e: MouseEvent) => {
++        e.stopPropagation();
++
++        // Base stations that don't support reading their power state report -1,
++        // so treat anything that isn't explicitly awake as asleep.
++        const anyAwake = baseStations.some(bs => bs.power_state === 9 || bs.power_state === 11);
++        const mode = anyAwake ? "sleep" : "awake";
++
++        for (const bs of baseStations) {
++            await ChangeBaseStationPowerStatus(bs.id, mode);
+         }
+     }
+ 
+@@ -40,7 +48,7 @@ export function BaseStationGroup({ group, id }: { id: string, group: LighthouseG
+             <AnimatePresence>
+ 
+             <motion.div key={"awoke"}>
+-                <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={updatePowerState}>
++                <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={(e) => updatePowerState(e)}>
+                    <CirclePower color="#C6C6C6" strokeWidth={2}  />
+                 </button>
+             </motion.div>
+-- 
+2.55.0
+
+
+From d2f310cef77d0241417c006bd0a9a40f70d8de13 Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Wed, 5 Aug 2026 05:47:14 +0200
+Subject: [PATCH 3/6] fix(ui): don't treat an unreadable power state as
+ "asleep"
+
+Base stations whose power characteristic doesn't advertise the read
+property (the norm on Windows, where notifications aren't supported
+either) never report a power state, so power_state stays -1 forever.
+The UI treated -1 as "not awake", which caused two problems:
+
+- The status dot showed red/asleep for a station that is very likely
+  powered on - the app was stating something it has no way to know.
+- Every power toggle sent "awake", because "not awake" implied
+  "asleep". Clicking the button on a station that was already on did
+  nothing visible, so the station could never be turned off.
+
+Treat -1 as its own "unknown" state: show it with a neutral dot, and
+have toggles assume such a station may be on, so they send "sleep"
+first. Once we've written a state ourselves we know it, and the
+toggle behaves normally from then on.
+
+Shared between the per-station, group and "power all" toggles via
+frontend/src/lib/powerState.ts so the three can't drift apart.
+
+(cherry picked from commit 16602e1052212403f59346de3f855a448323bfa7)
+---
+ frontend/src/components/BaseStation.tsx       | 18 +++++-----
+ frontend/src/components/BaseStationGroups.tsx | 10 +++---
+ frontend/src/components/TitleBar.tsx          | 11 +++---
+ frontend/src/lib/powerState.ts                | 34 +++++++++++++++++++
+ 4 files changed, 54 insertions(+), 19 deletions(-)
+ create mode 100644 frontend/src/lib/powerState.ts
+
+diff --git a/frontend/src/components/BaseStation.tsx b/frontend/src/components/BaseStation.tsx
+index 9aef1e0..d9e17b7 100644
+--- a/frontend/src/components/BaseStation.tsx
++++ b/frontend/src/components/BaseStation.tsx
+@@ -9,11 +9,12 @@ import { useTranslation } from "react-i18next";
+ import { ChevronRightIcon, CirclePower, Eye } from "lucide-preact";
+ import type { LighthouseStation } from "@src/lib/types/index";
+ import { useWebsocketCommunication } from "@src/lib/hooks/useWebsocketCommunication";
++import { isAwake, isUnknown, nextPowerCommand } from "@src/lib/powerState";
+ 
+ 
+ export function BaseStation({ station, onSelect, selected, editMode }: { station: LighthouseStation, onSelect?: () => void, selected: boolean, editMode?: boolean }) {
+ 
+-    const isAwoke = [0x0B, 0x01, 0x09].includes(station.power_state);
++    const isAwoke = isAwake(station.power_state);
+     const send = useWebsocketCommunication();
+ 
+     const [identitfyDisabled, setIdentitfyhDisabled] = useState(false);
+@@ -31,14 +32,7 @@ export function BaseStation({ station, onSelect, selected, editMode }: { station
+     }
+ 
+     const updatePowerState = async () => {
+-        if (isAwoke) {
+-            //Sleeping of
+-            let result = await ChangeBaseStationPowerStatus(station.id, "sleep");
+-            return;
+-        }
+-
+-        //Waking it up
+-        await ChangeBaseStationPowerStatus(station.id, "awake");
++        await ChangeBaseStationPowerStatus(station.id, nextPowerCommand(station.power_state));
+     }
+ 
+     const { t } = useTranslation();
+@@ -49,6 +43,10 @@ export function BaseStation({ station, onSelect, selected, editMode }: { station
+ 
+         if (station.status != "ready") return "preloaded"
+ 
++        // Don't claim the station is asleep when we simply never managed to
++        // read its power state - show it as unknown instead.
++        if (isUnknown(station.power_state)) return "unknown"
++
+         return isAwoke ? "awoke" : "sleep"
+     }, [station.power_state, station.status])
+ 
+@@ -60,7 +58,7 @@ export function BaseStation({ station, onSelect, selected, editMode }: { station
+             <div className="flex flex-col gap-[2px] text-[14px]">
+                 <span className="flex flex-row gap-[6px] items-center">
+                     <span>{station.name} </span>
+-                    <StatusCircleIcon class={`data-[status="sleep"]:fill-red-500 data-[status="preloaded"]:fill-blue-500 data-[status="awoke"]:fill-green-500 duration-300`} data-status={baseStationStatus} />
++                    <StatusCircleIcon class={`data-[status="sleep"]:fill-red-500 data-[status="preloaded"]:fill-blue-500 data-[status="awoke"]:fill-green-500 data-[status="unknown"]:fill-neutral-500 duration-300`} data-status={baseStationStatus} />
+ 
+                 </span>
+                 <AnimatePresence mode="wait">
+diff --git a/frontend/src/components/BaseStationGroups.tsx b/frontend/src/components/BaseStationGroups.tsx
+index 8674e4f..112b2c2 100644
+--- a/frontend/src/components/BaseStationGroups.tsx
++++ b/frontend/src/components/BaseStationGroups.tsx
+@@ -6,6 +6,7 @@ import { useTranslation } from "react-i18next";
+ import { AnimatePresence, motion } from "framer-motion";
+ import { CirclePower, Settings } from "lucide-preact";
+ import { ChangeBaseStationPowerStatus } from "@src/lib/native/index";
++import { isAwake, isUnknown } from "@src/lib/powerState";
+ export function BaseStationGroup({ group, id }: { id: string, group: LighthouseGroup }) {
+ 
+     const baseStations = useGroupedLighthouses(id);
+@@ -16,10 +17,11 @@ export function BaseStationGroup({ group, id }: { id: string, group: LighthouseG
+     const updatePowerState = async (e: MouseEvent) => {
+         e.stopPropagation();
+ 
+-        // Base stations that don't support reading their power state report -1,
+-        // so treat anything that isn't explicitly awake as asleep.
+-        const anyAwake = baseStations.some(bs => bs.power_state === 9 || bs.power_state === 11);
+-        const mode = anyAwake ? "sleep" : "awake";
++        // A station we couldn't read counts as "possibly on", so the group
++        // toggle turns everything off first instead of sending a wake command
++        // to stations that are already awake.
++        const anyOn = baseStations.some(bs => isAwake(bs.power_state) || isUnknown(bs.power_state));
++        const mode = anyOn ? "sleep" : "awake";
+ 
+         for (const bs of baseStations) {
+             await ChangeBaseStationPowerStatus(bs.id, mode);
+diff --git a/frontend/src/components/TitleBar.tsx b/frontend/src/components/TitleBar.tsx
+index d7ad872..d548873 100644
+--- a/frontend/src/components/TitleBar.tsx
++++ b/frontend/src/components/TitleBar.tsx
+@@ -13,6 +13,7 @@ import { useSteamVRStatus } from "@src/lib/hooks/useSteamVRStatus";
+ import { WebsocketContext } from "@src/lib/context/websocket.context";
+ import { usePlatform } from "@src/lib/hooks/usePlatform";
+ import { useLighthouseGroups } from "@src/lib/hooks/useLighthouseGroups";
++import { isAwake, isUnknown } from "@src/lib/powerState";
+ 
+ 
+ 
+@@ -61,15 +62,15 @@ export function TitleBar() {
+ 
+   
+     const toggleAllBaseStations = async () => {
+-        // Base stations that don't support reading their power state report -1.
+-        // Treat anything that isn't explicitly awake as "asleep" so the button
+-        // wakes them up instead of sending another sleep command.
+-        const anyAwake = lighthouses.some(c => c.power_state === 9 || c.power_state === 11);
++        // A station we couldn't read counts as "possibly on", so the toggle
++        // turns everything off first rather than sending a wake command to
++        // stations that are already awake.
++        const anyOn = lighthouses.some(c => isAwake(c.power_state) || isUnknown(c.power_state));
+ 
+         // Note: previousSteamVRState tracks SteamVR only. Overwriting it here
+         // made a manual toggle flip the automation, so that starting SteamVR
+         // afterwards sent "sleep" instead of "awake".
+-        if (!anyAwake) {
++        if (!anyOn) {
+             console.log("Waking up everything");
+             return await bulkUpdate("awake");
+         }
+diff --git a/frontend/src/lib/powerState.ts b/frontend/src/lib/powerState.ts
+new file mode 100644
+index 0000000..491cd0e
+--- /dev/null
++++ b/frontend/src/lib/powerState.ts
+@@ -0,0 +1,34 @@
++// Power state values reported by a Lighthouse 2.0 base station.
++export const POWER_STATE_SLEEP = 0x00;
++export const POWER_STATE_STANDBY = 0x02;
++export const POWER_STATE_AWAKE = 0x09;
++export const POWER_STATE_AWAKE_ALT = 0x0b;
++export const POWER_STATE_AWAKE_BOOTING = 0x01;
++
++/**
++ * -1 means the base station never reported a power state. This is the normal
++ * case on Windows, where the power characteristic doesn't advertise the read
++ * property and doesn't support notifications, so there is no way to learn the
++ * real state until we ourselves write one.
++ */
++export const POWER_STATE_UNKNOWN = -1;
++
++export function isAwake(powerState: number): boolean {
++    return [POWER_STATE_AWAKE, POWER_STATE_AWAKE_ALT, POWER_STATE_AWAKE_BOOTING].includes(powerState);
++}
++
++export function isUnknown(powerState: number): boolean {
++    return powerState === POWER_STATE_UNKNOWN;
++}
++
++/**
++ * Which command a power toggle should send.
++ *
++ * A station whose state we don't know is assumed to be on: base stations power
++ * on by default, so "unknown" almost always means "on, we just couldn't read
++ * it". Sending "awake" to an already-awake station looks like the button does
++ * nothing, which is exactly the bug this avoids.
++ */
++export function nextPowerCommand(powerState: number): "sleep" | "awake" {
++    return isAwake(powerState) || isUnknown(powerState) ? "sleep" : "awake";
++}
+-- 
+2.55.0
+
+
+From ca13b579d6f85a9deab32c5175223a3b572ccc6c Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Wed, 5 Aug 2026 06:53:16 +0200
+Subject: [PATCH 4/6] fix(ui): don't let a second click reverse a power command
+ mid-boot
+
+A base station takes tens of seconds to spin up, and on hardware that
+doesn't report its power state there is nothing to show for it in the
+meantime. So the station looks like it ignored the click, the obvious
+reaction is to click again - and because the app has already cached
+the state it just wrote, that second click sends the opposite command
+and the station stops partway through booting.
+
+Seen in a live log: both stations were woken at 06:46:35, then put
+back to sleep at 06:46:41, six seconds in.
+
+Give the power controls the same cooldown the identify button already
+uses, long enough to cover the spin-up.
+
+(cherry picked from commit d1e1a75f7d6b73a2d84338142e6ceab4533cfcc6)
+---
+ frontend/src/components/BaseStation.tsx       | 12 +++++++++++-
+ frontend/src/components/BaseStationGroups.tsx | 12 +++++++++++-
+ frontend/src/components/TitleBar.tsx          | 11 ++++++++++-
+ 3 files changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/frontend/src/components/BaseStation.tsx b/frontend/src/components/BaseStation.tsx
+index d9e17b7..ef9fe6c 100644
+--- a/frontend/src/components/BaseStation.tsx
++++ b/frontend/src/components/BaseStation.tsx
+@@ -31,7 +31,17 @@ export function BaseStation({ station, onSelect, selected, editMode }: { station
+         }, 20000)
+     }
+ 
++    const [powerBusy, setPowerBusy] = useState(false);
+     const updatePowerState = async () => {
++        if (powerBusy) return;
++
++        // A base station takes tens of seconds to spin up, and hardware that
++        // doesn't report its power state gives us nothing to show for it. With
++        // no feedback an impatient second click reads as "still off" and sends
++        // the opposite command, so the station never finishes booting.
++        setPowerBusy(true);
++        setTimeout(() => setPowerBusy(false), 15000);
++
+         await ChangeBaseStationPowerStatus(station.id, nextPowerCommand(station.power_state));
+     }
+ 
+@@ -88,7 +98,7 @@ export function BaseStation({ station, onSelect, selected, editMode }: { station
+                     : null}
+ 
+                 {!editMode && <motion.div key={"awoke"} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+-                    {station.status == "ready" && <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={updatePowerState}>
++                    {station.status == "ready" && <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={updatePowerState} disabled={powerBusy}>
+                         <CirclePower color="#C6C6C6" strokeWidth={2} />
+                     </button>}
+                 </motion.div>}
+diff --git a/frontend/src/components/BaseStationGroups.tsx b/frontend/src/components/BaseStationGroups.tsx
+index 112b2c2..855dc1e 100644
+--- a/frontend/src/components/BaseStationGroups.tsx
++++ b/frontend/src/components/BaseStationGroups.tsx
+@@ -1,4 +1,5 @@
+ import { useRouter } from "preact-router";
++import { useState } from "preact/hooks";
+ import { GroupedBaseStations } from "../assets/icons/GroupedBaseStations";
+ import { useGroupedLighthouses } from "@src/lib/hooks/useGroupedLighthouses";
+ import type { LighthouseGroup } from "@src/lib/types";
+@@ -14,9 +15,18 @@ export function BaseStationGroup({ group, id }: { id: string, group: LighthouseG
+     const { t } = useTranslation();
+ 
+ 
++    const [powerBusy, setPowerBusy] = useState(false);
+     const updatePowerState = async (e: MouseEvent) => {
+         e.stopPropagation();
+ 
++        if (powerBusy) return;
++
++        // Base stations take tens of seconds to spin up. Without a cooldown an
++        // impatient second click sends the opposite command mid-boot and they
++        // never come up - see the same guard in BaseStation.
++        setPowerBusy(true);
++        setTimeout(() => setPowerBusy(false), 15000);
++
+         // A station we couldn't read counts as "possibly on", so the group
+         // toggle turns everything off first instead of sending a wake command
+         // to stations that are already awake.
+@@ -50,7 +60,7 @@ export function BaseStationGroup({ group, id }: { id: string, group: LighthouseG
+             <AnimatePresence>
+ 
+             <motion.div key={"awoke"}>
+-                <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={(e) => updatePowerState(e)}>
++                <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={(e) => updatePowerState(e)} disabled={powerBusy}>
+                    <CirclePower color="#C6C6C6" strokeWidth={2}  />
+                 </button>
+             </motion.div>
+diff --git a/frontend/src/components/TitleBar.tsx b/frontend/src/components/TitleBar.tsx
+index d548873..b8233c9 100644
+--- a/frontend/src/components/TitleBar.tsx
++++ b/frontend/src/components/TitleBar.tsx
+@@ -61,7 +61,16 @@ export function TitleBar() {
+     }, [steamVRLaunched]);
+ 
+   
++    const [powerBusy, setPowerBusy] = useState(false);
+     const toggleAllBaseStations = async () => {
++        if (powerBusy) return;
++
++        // Base stations take tens of seconds to spin up. Without a cooldown an
++        // impatient second click sends the opposite command mid-boot and they
++        // never come up - see the same guard in BaseStation.
++        setPowerBusy(true);
++        setTimeout(() => setPowerBusy(false), 15000);
++
+         // A station we couldn't read counts as "possibly on", so the toggle
+         // turns everything off first rather than sending a wake command to
+         // stations that are already awake.
+@@ -121,7 +130,7 @@ export function TitleBar() {
+ 
+ 
+             </AnimatePresence>
+-            <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25" onClick={toggleAllBaseStations}>
++            <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25" onClick={toggleAllBaseStations} disabled={powerBusy}>
+                 <PowerCircle color="#C6C6C6"/>
+             </button>
+             <button onClick={(c) => route("/settings", true)}>
+-- 
+2.55.0
+
+
+From de1caa584bd170945e941fff98aebe7de41b1f15 Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Wed, 5 Aug 2026 07:09:08 +0200
+Subject: [PATCH 5/6] fix(ui): replace the guessing power toggle with explicit
+ on/off buttons
+
+On Windows the power characteristic is write-only - it reports
+properties 0x08, with no read and no notify. So power_state is -1
+after every start and the app has no way to know whether a station is
+on. A single toggle has to guess, and each guess broke one direction:
+
+- Assuming unknown meant "off" sent "awake" on click, so stations
+  could never be turned off.
+- Assuming unknown meant "possibly on" sent "sleep" on click, so they
+  could never be turned on. In a live log both stations got value 0
+  while the user was trying to start them.
+
+Writing to the characteristic works fine either way - a direct write
+outside the app starts both stations - so the only defect was the
+command the app picked.
+
+Show a separate on and off button instead, everywhere a power control
+exists (station row, group row, header). The app no longer guesses,
+and the controls don't change meaning underneath the user.
+
+The status dot still reports awake / asleep / unknown, and the 15s
+cooldown still covers the spin-up so an early second press can't abort
+a boot.
+
+(cherry picked from commit f54df29062b110ad0ac943b4227d07e48a48fbda)
+---
+ frontend/src/components/BaseStation.tsx       | 32 ++++++++++------
+ frontend/src/components/BaseStationGroups.tsx | 26 ++++++-------
+ frontend/src/components/TitleBar.tsx          | 38 ++++++++-----------
+ frontend/src/lib/powerState.ts                | 12 ------
+ frontend/src/localization/locales/en.json     |  4 +-
+ frontend/src/localization/locales/ru.json     |  4 +-
+ frontend/src/localization/locales/zh_cn.json  |  4 +-
+ 7 files changed, 57 insertions(+), 63 deletions(-)
+
+diff --git a/frontend/src/components/BaseStation.tsx b/frontend/src/components/BaseStation.tsx
+index ef9fe6c..510e50b 100644
+--- a/frontend/src/components/BaseStation.tsx
++++ b/frontend/src/components/BaseStation.tsx
+@@ -6,10 +6,10 @@ import { ChangeBaseStationPowerStatus, IdentitifyBaseStation } from "@src/lib/na
+ import { StatusCircleIcon } from "../assets/icons/StatusCircleIcon";
+ import { route } from "preact-router";
+ import { useTranslation } from "react-i18next";
+-import { ChevronRightIcon, CirclePower, Eye } from "lucide-preact";
++import { ChevronRightIcon, Eye, Power, PowerOff } from "lucide-preact";
+ import type { LighthouseStation } from "@src/lib/types/index";
+ import { useWebsocketCommunication } from "@src/lib/hooks/useWebsocketCommunication";
+-import { isAwake, isUnknown, nextPowerCommand } from "@src/lib/powerState";
++import { isAwake, isUnknown } from "@src/lib/powerState";
+ 
+ 
+ export function BaseStation({ station, onSelect, selected, editMode }: { station: LighthouseStation, onSelect?: () => void, selected: boolean, editMode?: boolean }) {
+@@ -32,17 +32,20 @@ export function BaseStation({ station, onSelect, selected, editMode }: { station
+     }
+ 
+     const [powerBusy, setPowerBusy] = useState(false);
+-    const updatePowerState = async () => {
++
++    // Explicit commands rather than one toggle: on Windows the power
++    // characteristic is write-only, so the app can't tell whether a station is
++    // on. A toggle would have to guess, and a wrong guess sends the opposite of
++    // what was wanted.
++    const setPower = async (mode: "awake" | "sleep") => {
+         if (powerBusy) return;
+ 
+-        // A base station takes tens of seconds to spin up, and hardware that
+-        // doesn't report its power state gives us nothing to show for it. With
+-        // no feedback an impatient second click reads as "still off" and sends
+-        // the opposite command, so the station never finishes booting.
++        // A base station takes tens of seconds to spin up and shows nothing for
++        // it here, so an impatient second click used to abort the boot.
+         setPowerBusy(true);
+         setTimeout(() => setPowerBusy(false), 15000);
+ 
+-        await ChangeBaseStationPowerStatus(station.id, nextPowerCommand(station.power_state));
++        await ChangeBaseStationPowerStatus(station.id, mode);
+     }
+ 
+     const { t } = useTranslation();
+@@ -97,10 +100,15 @@ export function BaseStation({ station, onSelect, selected, editMode }: { station
+                 </motion.div>
+                     : null}
+ 
+-                {!editMode && <motion.div key={"awoke"} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+-                    {station.status == "ready" && <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={updatePowerState} disabled={powerBusy}>
+-                        <CirclePower color="#C6C6C6" strokeWidth={2} />
+-                    </button>}
++                {!editMode && <motion.div key={"awoke"} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="flex flex-row gap-[8px]">
++                    {station.status == "ready" && <>
++                        <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={() => setPower("awake")} disabled={powerBusy} title={t("Turn on")}>
++                            <Power color="#C6C6C6" strokeWidth={2} />
++                        </button>
++                        <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={() => setPower("sleep")} disabled={powerBusy} title={t("Turn off")}>
++                            <PowerOff color="#C6C6C6" strokeWidth={2} />
++                        </button>
++                    </>}
+                 </motion.div>}
+ 
+                 {!editMode && <motion.div key={"open"} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+diff --git a/frontend/src/components/BaseStationGroups.tsx b/frontend/src/components/BaseStationGroups.tsx
+index 855dc1e..e55f779 100644
+--- a/frontend/src/components/BaseStationGroups.tsx
++++ b/frontend/src/components/BaseStationGroups.tsx
+@@ -5,9 +5,8 @@ import { useGroupedLighthouses } from "@src/lib/hooks/useGroupedLighthouses";
+ import type { LighthouseGroup } from "@src/lib/types";
+ import { useTranslation } from "react-i18next";
+ import { AnimatePresence, motion } from "framer-motion";
+-import { CirclePower, Settings } from "lucide-preact";
++import { Power, PowerOff, Settings } from "lucide-preact";
+ import { ChangeBaseStationPowerStatus } from "@src/lib/native/index";
+-import { isAwake, isUnknown } from "@src/lib/powerState";
+ export function BaseStationGroup({ group, id }: { id: string, group: LighthouseGroup }) {
+ 
+     const baseStations = useGroupedLighthouses(id);
+@@ -16,23 +15,19 @@ export function BaseStationGroup({ group, id }: { id: string, group: LighthouseG
+ 
+ 
+     const [powerBusy, setPowerBusy] = useState(false);
+-    const updatePowerState = async (e: MouseEvent) => {
++
++    // Explicit commands rather than one toggle - the app can't read a station's
++    // power state on Windows, so a toggle would have to guess. See BaseStation.
++    const setPower = async (e: MouseEvent, mode: "awake" | "sleep") => {
+         e.stopPropagation();
+ 
+         if (powerBusy) return;
+ 
+         // Base stations take tens of seconds to spin up. Without a cooldown an
+-        // impatient second click sends the opposite command mid-boot and they
+-        // never come up - see the same guard in BaseStation.
++        // impatient second click aborts the boot - same guard as BaseStation.
+         setPowerBusy(true);
+         setTimeout(() => setPowerBusy(false), 15000);
+ 
+-        // A station we couldn't read counts as "possibly on", so the group
+-        // toggle turns everything off first instead of sending a wake command
+-        // to stations that are already awake.
+-        const anyOn = baseStations.some(bs => isAwake(bs.power_state) || isUnknown(bs.power_state));
+-        const mode = anyOn ? "sleep" : "awake";
+-
+         for (const bs of baseStations) {
+             await ChangeBaseStationPowerStatus(bs.id, mode);
+         }
+@@ -59,9 +54,12 @@ export function BaseStationGroup({ group, id }: { id: string, group: LighthouseG
+         <div className="flex flex-row gap-[8px] [&>*]:flex [&>*]:items-center">
+             <AnimatePresence>
+ 
+-            <motion.div key={"awoke"}>
+-                <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={(e) => updatePowerState(e)} disabled={powerBusy}>
+-                   <CirclePower color="#C6C6C6" strokeWidth={2}  />
++            <motion.div key={"awoke"} className="flex flex-row gap-[8px]">
++                <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={(e) => setPower(e, "awake")} disabled={powerBusy} title={t("Turn on")}>
++                   <Power color="#C6C6C6" strokeWidth={2}  />
++                </button>
++                <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={(e) => setPower(e, "sleep")} disabled={powerBusy} title={t("Turn off")}>
++                   <PowerOff color="#C6C6C6" strokeWidth={2}  />
+                 </button>
+             </motion.div>
+ 
+diff --git a/frontend/src/components/TitleBar.tsx b/frontend/src/components/TitleBar.tsx
+index b8233c9..5999158 100644
+--- a/frontend/src/components/TitleBar.tsx
++++ b/frontend/src/components/TitleBar.tsx
+@@ -1,4 +1,4 @@
+-import { PowerCircle, SettingsIcon, X, XIcon } from "lucide-preact";
++import { Power, PowerOff, SettingsIcon, X, XIcon } from "lucide-preact";
+ import { ChangeBaseStationPowerStatus, UpdateConfigValue } from "@src/lib/native/index";
+ import { useContext, useEffect, useState } from "preact/hooks";
+ import { AnimatePresence, motion } from 'framer-motion';
+@@ -13,7 +13,6 @@ import { useSteamVRStatus } from "@src/lib/hooks/useSteamVRStatus";
+ import { WebsocketContext } from "@src/lib/context/websocket.context";
+ import { usePlatform } from "@src/lib/hooks/usePlatform";
+ import { useLighthouseGroups } from "@src/lib/hooks/useLighthouseGroups";
+-import { isAwake, isUnknown } from "@src/lib/powerState";
+ 
+ 
+ 
+@@ -62,30 +61,22 @@ export function TitleBar() {
+ 
+   
+     const [powerBusy, setPowerBusy] = useState(false);
+-    const toggleAllBaseStations = async () => {
++
++    // Explicit commands rather than one toggle - the app can't read a station's
++    // power state on Windows, so a toggle would have to guess. See BaseStation.
++    //
++    // Note: this deliberately doesn't touch previousSteamVRState. That tracks
++    // SteamVR only, and writing to it here made a manual press flip the
++    // automation so the next SteamVR launch sent "sleep" instead of "awake".
++    const setAllPower = async (mode: "awake" | "sleep") => {
+         if (powerBusy) return;
+ 
+         // Base stations take tens of seconds to spin up. Without a cooldown an
+-        // impatient second click sends the opposite command mid-boot and they
+-        // never come up - see the same guard in BaseStation.
++        // impatient second click aborts the boot - same guard as BaseStation.
+         setPowerBusy(true);
+         setTimeout(() => setPowerBusy(false), 15000);
+ 
+-        // A station we couldn't read counts as "possibly on", so the toggle
+-        // turns everything off first rather than sending a wake command to
+-        // stations that are already awake.
+-        const anyOn = lighthouses.some(c => isAwake(c.power_state) || isUnknown(c.power_state));
+-
+-        // Note: previousSteamVRState tracks SteamVR only. Overwriting it here
+-        // made a manual toggle flip the automation, so that starting SteamVR
+-        // afterwards sent "sleep" instead of "awake".
+-        if (!anyOn) {
+-            console.log("Waking up everything");
+-            return await bulkUpdate("awake");
+-        }
+-
+-        console.log("Putting all base station in sleep mode");
+-        await bulkUpdate("sleep");
++        await bulkUpdate(mode);
+     }
+ 
+     const Quit = async () => {
+@@ -130,8 +121,11 @@ export function TitleBar() {
+ 
+ 
+             </AnimatePresence>
+-            <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25" onClick={toggleAllBaseStations} disabled={powerBusy}>
+-                <PowerCircle color="#C6C6C6"/>
++            <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25" onClick={() => setAllPower("awake")} disabled={powerBusy} title={t("Turn on")}>
++                <Power color="#C6C6C6"/>
++            </button>
++            <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25" onClick={() => setAllPower("sleep")} disabled={powerBusy} title={t("Turn off")}>
++                <PowerOff color="#C6C6C6"/>
+             </button>
+             <button onClick={(c) => route("/settings", true)}>
+                 {/* <TitleBarSettingsIcon width={16} height={16} fill="#888888" className={`hover:fill-[#1D81FF] duration-200`} /> */}
+diff --git a/frontend/src/lib/powerState.ts b/frontend/src/lib/powerState.ts
+index 491cd0e..4637251 100644
+--- a/frontend/src/lib/powerState.ts
++++ b/frontend/src/lib/powerState.ts
+@@ -20,15 +20,3 @@ export function isAwake(powerState: number): boolean {
+ export function isUnknown(powerState: number): boolean {
+     return powerState === POWER_STATE_UNKNOWN;
+ }
+-
+-/**
+- * Which command a power toggle should send.
+- *
+- * A station whose state we don't know is assumed to be on: base stations power
+- * on by default, so "unknown" almost always means "on, we just couldn't read
+- * it". Sending "awake" to an already-awake station looks like the button does
+- * nothing, which is exactly the bug this avoids.
+- */
+-export function nextPowerCommand(powerState: number): "sleep" | "awake" {
+-    return isAwake(powerState) || isUnknown(powerState) ? "sleep" : "awake";
+-}
+diff --git a/frontend/src/localization/locales/en.json b/frontend/src/localization/locales/en.json
+index 548fb11..9bd83c8 100644
+--- a/frontend/src/localization/locales/en.json
++++ b/frontend/src/localization/locales/en.json
+@@ -47,7 +47,9 @@
+     "Manage Power (Power on)": "Manage Power (Power on)",
+     "Wake up base stations on SteamVR Launch": "Wake up base stations on SteamVR Launch",
+     "Manage Power (Power Off)": "Manage Power (Power off)",
+-    "Power off base stations on SteamVR Exit": "Power off base stations on SteamVR exit"
++    "Power off base stations on SteamVR Exit": "Power off base stations on SteamVR exit",
++    "Turn on": "Turn on",
++    "Turn off": "Turn off"
+     
+ 
+ }
+\ No newline at end of file
+diff --git a/frontend/src/localization/locales/ru.json b/frontend/src/localization/locales/ru.json
+index 9c10342..d5b5d8f 100644
+--- a/frontend/src/localization/locales/ru.json
++++ b/frontend/src/localization/locales/ru.json
+@@ -50,5 +50,7 @@
+     "Manage Power (Power on)": "Управление питанием (Включение)",
+     "Wake up base stations on SteamVR Launch": "Включать базовые станции при запуске SteamVR",
+     "Manage Power (Power Off)": "Управление питанием (Выключение)",
+-    "Power off base stations on SteamVR Exit": "Погружать базовые станции в сон при выходе из SteamVR"
++    "Power off base stations on SteamVR Exit": "Погружать базовые станции в сон при выходе из SteamVR",
++    "Turn on": "Включить",
++    "Turn off": "Выключить"
+ }
+\ No newline at end of file
+diff --git a/frontend/src/localization/locales/zh_cn.json b/frontend/src/localization/locales/zh_cn.json
+index a20a3e7..20f4125 100644
+--- a/frontend/src/localization/locales/zh_cn.json
++++ b/frontend/src/localization/locales/zh_cn.json
+@@ -24,5 +24,7 @@
+     "Found base stations": "发现 {{baseStations}} 个基站",
+     "Allow tray": "允许托盘图标",
+     "Run the application in the tray when SteamVR is active or when the main window is closed.": "当SteamVR活跃或主窗口关闭时切换至在托盘中运行",
+-    "This platform is not supported": "This platform is not supported"
++    "This platform is not supported": "This platform is not supported",
++    "Turn on": "开启",
++    "Turn off": "关闭"
+ }
+\ No newline at end of file
+-- 
+2.55.0
+
+
+From 3dfd2e730f43c5fc44aeed0d8277819860927a53 Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Wed, 5 Aug 2026 07:23:19 +0200
+Subject: [PATCH 6/6] fix(ui): stop swallowing power presses, and report failed
+ commands
+
+The power controls held a flat 15s cooldown after every press. That
+was added back when a single toggle meant a quick second click sent
+the opposite command and aborted a boot - with separate on/off buttons
+that hazard is gone, since pressing "on" twice just sends awake twice.
+All the cooldown did was drop legitimate presses, and because each
+control kept its own timer, which presses landed looked arbitrary.
+
+Hold the guard only while the command is actually in flight, so
+overlapping runs still can't race but the button frees up as soon as
+the work is done. Verified: three presses three seconds apart now all
+reach the base stations, where before only the first did.
+
+Also surface failures. The ChangeBaseStationPowerStatus wrapper
+awaited the call but never returned its result, so "error: base
+station not connected" - which the Go side can take 30s of retrying to
+decide - was dropped on the floor and a failed command looked exactly
+like a swallowed one.
+
+bulkUpdate returns the failures instead of reporting them itself: the
+manual buttons show them, while the SteamVR automation only logs, so
+no dialog can appear while the app sits unattended in the tray.
+
+(cherry picked from commit afddfef9cf253852923db9ea30f530d42a3e00f3)
+---
+ frontend/src/components/BaseStation.tsx       | 14 +++++----
+ frontend/src/components/BaseStationGroups.tsx | 17 +++++++----
+ frontend/src/components/TitleBar.tsx          | 30 +++++++++++++------
+ frontend/src/lib/native/index.ts              |  4 +--
+ 4 files changed, 43 insertions(+), 22 deletions(-)
+
+diff --git a/frontend/src/components/BaseStation.tsx b/frontend/src/components/BaseStation.tsx
+index 510e50b..ff14833 100644
+--- a/frontend/src/components/BaseStation.tsx
++++ b/frontend/src/components/BaseStation.tsx
+@@ -38,14 +38,18 @@ export function BaseStation({ station, onSelect, selected, editMode }: { station
+     // on. A toggle would have to guess, and a wrong guess sends the opposite of
+     // what was wanted.
+     const setPower = async (mode: "awake" | "sleep") => {
++        // Held only while the command is in flight - it can take a while when
++        // the station has to be reconnected first, and overlapping presses
++        // would race. A press with nothing in flight always goes through.
+         if (powerBusy) return;
+-
+-        // A base station takes tens of seconds to spin up and shows nothing for
+-        // it here, so an impatient second click used to abort the boot.
+         setPowerBusy(true);
+-        setTimeout(() => setPowerBusy(false), 15000);
+ 
+-        await ChangeBaseStationPowerStatus(station.id, mode);
++        try {
++            const result = await ChangeBaseStationPowerStatus(station.id, mode);
++            if (result != "ok") alert(result);
++        } finally {
++            setPowerBusy(false);
++        }
+     }
+ 
+     const { t } = useTranslation();
+diff --git a/frontend/src/components/BaseStationGroups.tsx b/frontend/src/components/BaseStationGroups.tsx
+index e55f779..c0acb5a 100644
+--- a/frontend/src/components/BaseStationGroups.tsx
++++ b/frontend/src/components/BaseStationGroups.tsx
+@@ -21,15 +21,20 @@ export function BaseStationGroup({ group, id }: { id: string, group: LighthouseG
+     const setPower = async (e: MouseEvent, mode: "awake" | "sleep") => {
+         e.stopPropagation();
+ 
++        // Held only while the commands are in flight - see BaseStation.
+         if (powerBusy) return;
+-
+-        // Base stations take tens of seconds to spin up. Without a cooldown an
+-        // impatient second click aborts the boot - same guard as BaseStation.
+         setPowerBusy(true);
+-        setTimeout(() => setPowerBusy(false), 15000);
+ 
+-        for (const bs of baseStations) {
+-            await ChangeBaseStationPowerStatus(bs.id, mode);
++        try {
++            const failures: string[] = [];
++            for (const bs of baseStations) {
++                const result = await ChangeBaseStationPowerStatus(bs.id, mode);
++                if (result != "ok") failures.push(`${bs.name}: ${result}`);
++            }
++
++            if (failures.length) alert(failures.join("\n"));
++        } finally {
++            setPowerBusy(false);
+         }
+     }
+ 
+diff --git a/frontend/src/components/TitleBar.tsx b/frontend/src/components/TitleBar.tsx
+index 5999158..8ae4d03 100644
+--- a/frontend/src/components/TitleBar.tsx
++++ b/frontend/src/components/TitleBar.tsx
+@@ -28,12 +28,20 @@ export function TitleBar() {
+ 
+     const { t } = useTranslation();
+ 
++    // Returns the stations that refused the command rather than reporting them
++    // itself: the manual buttons surface these, while the SteamVR automation
++    // below only logs them - it runs unattended, often with the window hidden,
++    // where a dialog would be stuck behind the tray.
+     const bulkUpdate = async (state: "sleep" | "awake", flags: number = 0) => {
+-        
++        const failures: string[] = [];
++
+         for(const baseStation of lighthouses) {
+             if (flags && !((baseStation.managed_flags & flags) > 0)) continue;
+-            await ChangeBaseStationPowerStatus(baseStation.id, state);
++            const result = await ChangeBaseStationPowerStatus(baseStation.id, state);
++            if (result != "ok") failures.push(`${baseStation.name}: ${result}`);
+         }
++
++        return failures;
+     }
+ 
+     useEffect(() => {
+@@ -50,12 +58,14 @@ export function TitleBar() {
+ 
+             if (steamVRLaunched) {
+                 console.log("Waking up")
+-                await bulkUpdate("awake", 2);
++                const failures = await bulkUpdate("awake", 2);
++                if (failures.length) console.error("Failed to wake:", failures);
+                 return;
+             }
+ 
+             console.log("Putting in sleep mode")
+-            await bulkUpdate("sleep", 4);
++            const failures = await bulkUpdate("sleep", 4);
++            if (failures.length) console.error("Failed to sleep:", failures);
+         })()
+     }, [steamVRLaunched]);
+ 
+@@ -69,14 +79,16 @@ export function TitleBar() {
+     // SteamVR only, and writing to it here made a manual press flip the
+     // automation so the next SteamVR launch sent "sleep" instead of "awake".
+     const setAllPower = async (mode: "awake" | "sleep") => {
++        // Held only while the commands are in flight - see BaseStation.
+         if (powerBusy) return;
+-
+-        // Base stations take tens of seconds to spin up. Without a cooldown an
+-        // impatient second click aborts the boot - same guard as BaseStation.
+         setPowerBusy(true);
+-        setTimeout(() => setPowerBusy(false), 15000);
+ 
+-        await bulkUpdate(mode);
++        try {
++            const failures = await bulkUpdate(mode);
++            if (failures.length) alert(failures.join("\n"));
++        } finally {
++            setPowerBusy(false);
++        }
+     }
+ 
+     const Quit = async () => {
+diff --git a/frontend/src/lib/native/index.ts b/frontend/src/lib/native/index.ts
+index 6a87252..0f18e8c 100644
+--- a/frontend/src/lib/native/index.ts
++++ b/frontend/src/lib/native/index.ts
+@@ -6,8 +6,8 @@ import { WebsocketContext, type WebsocketContextType } from "../context/websocke
+ import * as native from "../../../wailsjs/go/main/App"
+ type status = "ok" | string
+ 
+-export const ChangeBaseStationPowerStatus = async (id: string, mode: "sleep" | "awake") => {
+-    await native.ChangeBaseStationPowerStatus(id, mode);
++export const ChangeBaseStationPowerStatus = async (id: string, mode: "sleep" | "awake"): Promise<status> => {
++    return native.ChangeBaseStationPowerStatus(id, mode);
+ }
+ 
+ export const RenameGroup = async (old: string, newName: string) => {
+-- 
+2.55.0
+
