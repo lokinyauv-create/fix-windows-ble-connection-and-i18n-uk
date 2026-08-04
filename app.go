@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -42,6 +43,8 @@ var BINARY_VERSION string
 type App struct {
 	ctx                   context.Context
 	bluetoothInitFinished bool
+	windowHidden          atomic.Bool
+	reconnecting          atomic.Bool
 }
 
 func NewApp() *App {
@@ -76,7 +79,7 @@ func (a *App) startup(ctx context.Context) {
 			running, _ := isProcRunning("vrserver.exe")
 
 			if !running && config.IsSteamVRManaged {
-				wruntime.WindowShow(a.ctx)
+				a.ShowFromTray()
 			}
 
 			WEBSOCKET_BROADCAST.Broadcast(preparePacket("steamvr.status", map[string]interface{}{
@@ -98,6 +101,9 @@ func (a *App) startup(ctx context.Context) {
 
 	if config.IsSteamVRManaged && runtime.GOOS == "windows" {
 		if running, _ := isProcRunning("vrserver.exe"); running {
+			// A session is already live, so keep the links and just get out of
+			// the way - HideToTray would hand the stations back mid-session.
+			a.windowHidden.Store(true)
 			wruntime.WindowHide(a.ctx)
 		}
 	}
@@ -106,6 +112,7 @@ func (a *App) startup(ctx context.Context) {
 	go StartHttp()
 
 	a.watchForTermination()
+	a.releaseWhenIdle()
 }
 
 // disconnectAllBaseStations drops every live BLE link we hold. A base station
@@ -122,6 +129,91 @@ func disconnectAllBaseStations() {
 		log.Printf("Disconnecting from base station %s before exit\n", name)
 		(*bs).Disconnect()
 	}
+}
+
+// anyBaseStationConnected reports whether we currently hold at least one link.
+func anyBaseStationConnected() bool {
+	for _, bs := range knownBaseStations.Items() {
+		if bs != nil && (*bs).GetStatus() == "ready" {
+			return true
+		}
+	}
+	return false
+}
+
+// HideToTray hides the window and lets go of the base stations. Sitting in the
+// tray holding them would keep them unusable from any other machine, and we
+// don't need the links until the window comes back or a VR session starts.
+func (a *App) HideToTray() {
+	a.windowHidden.Store(true)
+	wruntime.WindowHide(a.ctx)
+
+	if running, _ := isProcRunning("vrserver.exe"); running {
+		// A session is live - the automation still needs the links.
+		return
+	}
+
+	log.Println("Hidden to tray with no VR session - releasing base stations")
+	disconnectAllBaseStations()
+}
+
+// ShowFromTray brings the window back and re-establishes any link we dropped
+// while idling in the tray.
+func (a *App) ShowFromTray() {
+	a.windowHidden.Store(false)
+	wruntime.WindowShow(a.ctx)
+	a.ReconnectBaseStations()
+}
+
+// ReconnectBaseStations re-runs the preload pass, rebuilding links we released.
+// It is a no-op while a previous pass is still in flight or everything is
+// already connected.
+func (a *App) ReconnectBaseStations() {
+	if anyBaseStationConnected() {
+		return
+	}
+
+	if !a.reconnecting.CompareAndSwap(false, true) {
+		return
+	}
+
+	go func() {
+		defer a.reconnecting.Store(false)
+
+		log.Println("Reconnecting to base stations...")
+		a.preloadBaseStations()
+
+		// preloadBaseStations only kicks off the connection goroutines, so give
+		// them a moment before another caller is allowed to retry.
+		time.Sleep(10 * time.Second)
+	}()
+}
+
+// releaseWhenIdle drops the BLE links whenever the app is sitting in the tray
+// with no VR session running - e.g. after SteamVR exits and the stations have
+// been put to sleep. Without this the app would keep them claimed for as long
+// as it stays in the tray.
+func (a *App) releaseWhenIdle() {
+	go func() {
+		for {
+			time.Sleep(15 * time.Second)
+
+			if !a.windowHidden.Load() {
+				continue
+			}
+
+			if running, _ := isProcRunning("vrserver.exe"); running {
+				continue
+			}
+
+			if !anyBaseStationConnected() {
+				continue
+			}
+
+			log.Println("Idle in tray with no VR session - releasing base stations")
+			disconnectAllBaseStations()
+		}
+	}()
 }
 
 // watchForTermination releases the base stations when the process is asked to
@@ -459,6 +551,26 @@ func (a *App) ChangeBaseStationPowerStatus(baseStationMac string, status string)
 
 	if !found {
 		return "Unknown base station"
+	}
+
+	// The link may have been released while idling in the tray, so bring it
+	// back before trying to write. This is what lets the SteamVR automation
+	// still work after we've handed the stations back to the other machine.
+	if (*baseStation).GetStatus() != "ready" {
+		a.ReconnectBaseStations()
+
+		for i := 0; i < 30; i++ {
+			time.Sleep(time.Second)
+			if refreshed, ok := knownBaseStations.Get(baseStationMac); ok && (*refreshed).GetStatus() == "ready" {
+				baseStation = refreshed
+				break
+			}
+		}
+
+		if (*baseStation).GetStatus() != "ready" {
+			log.Printf("Could not reconnect to %s in time to change power state\n", baseStationMac)
+			return "error: base station not connected"
+		}
 	}
 
 	bs := *baseStation

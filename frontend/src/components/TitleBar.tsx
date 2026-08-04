@@ -82,8 +82,10 @@ export function TitleBar() {
 
 
         if (config.allow_tray) {
+            // HideToTray also releases the base stations, so they stay usable
+            // from another machine while we sit in the tray.
             //@ts-ignore
-            await window.runtime.Hide()
+            await window.go.main.App.HideToTray()
 
             if (!config.tray_notified) {
                 //@ts-ignore

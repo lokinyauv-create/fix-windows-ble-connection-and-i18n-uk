@@ -7,7 +7,6 @@ import (
 	"log"
 
 	"github.com/getlantern/systray"
-	wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // I REALLY SHOULD NOT DO THAT
@@ -28,7 +27,7 @@ func (a *App) trayReady() {
 		for {
 			select {
 			case <-showWindowCh.ClickedCh:
-				wruntime.WindowShow(a.ctx)
+				a.ShowFromTray()
 				continue
 			case <-wakeUpCh.ClickedCh:
 				a.WakeUpAllBaseStations()
