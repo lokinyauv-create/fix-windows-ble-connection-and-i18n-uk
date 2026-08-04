@@ -4,10 +4,12 @@ import (
 	"context"
 	"log"
 	"os"
+	"os/signal"
 	"path"
 	"runtime"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	_ "embed"
@@ -103,6 +105,45 @@ func (a *App) startup(ctx context.Context) {
 	go initializeSystray(a)
 	go StartHttp()
 
+	a.watchForTermination()
+}
+
+// disconnectAllBaseStations drops every live BLE link we hold. A base station
+// only accepts one connection at a time, so a link we leave open keeps it
+// unusable from any other machine. On Linux this matters even more: BlueZ owns
+// the connection at the daemon level, so it survives the process exiting and
+// the station stays claimed until something explicitly disconnects it.
+func disconnectAllBaseStations() {
+	for name, bs := range knownBaseStations.Items() {
+		if bs == nil {
+			continue
+		}
+
+		log.Printf("Disconnecting from base station %s before exit\n", name)
+		(*bs).Disconnect()
+	}
+}
+
+// watchForTermination releases the base stations when the process is asked to
+// quit from outside the UI (Ctrl+C, `kill`, a logout). SIGKILL can't be caught,
+// so a `kill -9` still leaves the stations claimed on Linux.
+func (a *App) watchForTermination() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		sig := <-signals
+		log.Printf("Received %v, releasing base stations before exit\n", sig)
+		disconnectAllBaseStations()
+		os.Exit(0)
+	}()
+}
+
+// shutdown is wired to Wails' OnShutdown so closing the window releases the
+// base stations. Without it the app exits still holding them.
+func (a *App) shutdown(ctx context.Context) {
+	log.Println("Shutting down, releasing base stations...")
+	disconnectAllBaseStations()
 }
 
 func (a *App) CreateGroup(name string, baseStations []string) string {
@@ -474,12 +515,7 @@ func (a *App) IdentitifyBaseStation(baseStationMac string) string {
 }
 
 func (a *App) Shutdown() {
-	for _, bs := range knownBaseStations.Items() {
-
-		if bs != nil {
-			(*bs).Disconnect()
-		}
-	}
+	disconnectAllBaseStations()
 
 	shutdownSystray()
 	os.Exit(0)
