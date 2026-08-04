@@ -92,14 +92,36 @@ func connectToPreloadedBaseStation(bs *LighthouseV2, config BaseStationConfigura
 		return
 	}
 
-	conn, err := adapter.Connect(bluetooth.Address{
-		MACAddress: bluetooth.MACAddress{
-			MAC: parsedMac,
-		},
-	}, bluetooth.ConnectionParams{})
-	if err != nil {
-		log.Printf("Failed to connect to base station: %s %+v", config.Id, err)
+	// adapter.Connect has no built-in timeout on Windows either, so a base
+	// station that never answers the WinRT connect request would otherwise
+	// hang this goroutine forever with no further retries.
+	type connectResult struct {
+		conn bluetooth.Device
+		err  error
+	}
+	connectDone := make(chan connectResult, 1)
+	go func() {
+		conn, err := adapter.Connect(bluetooth.Address{
+			MACAddress: bluetooth.MACAddress{
+				MAC: parsedMac,
+			},
+		}, bluetooth.ConnectionParams{})
+		connectDone <- connectResult{conn, err}
+	}()
 
+	var conn bluetooth.Device
+	select {
+	case res := <-connectDone:
+		if res.err != nil {
+			log.Printf("Failed to connect to base station: %s %+v", config.Id, res.err)
+
+			time.Sleep(time.Second)
+			connectToPreloadedBaseStation(bs, config, wakeUp, attemp+1)
+			return
+		}
+		conn = res.conn
+	case <-time.After(10 * time.Second):
+		log.Printf("Timed out connecting to base station %s after 10s, retrying (attempt %d)...\n", config.Id, attemp+1)
 		time.Sleep(time.Second)
 		connectToPreloadedBaseStation(bs, config, wakeUp, attemp+1)
 		return

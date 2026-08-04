@@ -11,6 +11,10 @@ import (
 )
 
 func connectToPreloadedBaseStation(bs *LighthouseV2, config BaseStationConfiguration, wakeUp bool, attemp int) {
+	if attemp > 5 {
+		log.Printf("Giving up connecting to base station %s after %d attempts\n", config.Id, attemp)
+		return
+	}
 
 	parsedMac, err := bluetooth.ParseMAC(config.MacAddress)
 
@@ -19,14 +23,37 @@ func connectToPreloadedBaseStation(bs *LighthouseV2, config BaseStationConfigura
 		return
 	}
 
-	conn, err := adapter.Connect(bluetooth.Address{
-		MACAddress: bluetooth.MACAddress{
-			MAC: parsedMac,
-		},
-	}, bluetooth.ConnectionParams{})
-	if err != nil {
-		log.Printf("Failed to connect to base station: %s %+v", config.Id, err)
+	// adapter.Connect blocks on a BlueZ D-Bus PropertiesChanged signal with no
+	// built-in timeout, so a base station that never answers (or a stale/
+	// unregistered BlueZ device object) hangs this goroutine forever with no
+	// further retries. Bound it so we always fall back to a retry.
+	type connectResult struct {
+		conn bluetooth.Device
+		err  error
+	}
+	connectDone := make(chan connectResult, 1)
+	go func() {
+		conn, err := adapter.Connect(bluetooth.Address{
+			MACAddress: bluetooth.MACAddress{
+				MAC: parsedMac,
+			},
+		}, bluetooth.ConnectionParams{})
+		connectDone <- connectResult{conn, err}
+	}()
 
+	var conn bluetooth.Device
+	select {
+	case res := <-connectDone:
+		if res.err != nil {
+			log.Printf("Failed to connect to base station: %s %+v", config.Id, res.err)
+
+			time.Sleep(time.Second)
+			connectToPreloadedBaseStation(bs, config, wakeUp, attemp+1)
+			return
+		}
+		conn = res.conn
+	case <-time.After(10 * time.Second):
+		log.Printf("Timed out connecting to base station %s after 10s, retrying (attempt %d)...\n", config.Id, attemp+1)
 		time.Sleep(time.Second)
 		connectToPreloadedBaseStation(bs, config, wakeUp, attemp+1)
 		return
