@@ -42,6 +42,10 @@ export function GetVersion() {
   return window['go']['main']['App']['GetVersion']();
 }
 
+export function HideToTray() {
+  return window['go']['main']['App']['HideToTray']();
+}
+
 export function IdentitifyBaseStation(arg1) {
   return window['go']['main']['App']['IdentitifyBaseStation'](arg1);
 }
@@ -66,12 +70,20 @@ export function Notify(arg1, arg2) {
   return window['go']['main']['App']['Notify'](arg1, arg2);
 }
 
+export function ReconnectBaseStations() {
+  return window['go']['main']['App']['ReconnectBaseStations']();
+}
+
 export function RemoveGroup(arg1) {
   return window['go']['main']['App']['RemoveGroup'](arg1);
 }
 
 export function RenameGroup(arg1, arg2) {
   return window['go']['main']['App']['RenameGroup'](arg1, arg2);
+}
+
+export function ShowFromTray() {
+  return window['go']['main']['App']['ShowFromTray']();
 }
 
 export function Shutdown() {
