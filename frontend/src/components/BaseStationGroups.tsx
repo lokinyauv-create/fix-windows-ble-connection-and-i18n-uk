@@ -21,15 +21,20 @@ export function BaseStationGroup({ group, id }: { id: string, group: LighthouseG
     const setPower = async (e: MouseEvent, mode: "awake" | "sleep") => {
         e.stopPropagation();
 
+        // Held only while the commands are in flight - see BaseStation.
         if (powerBusy) return;
-
-        // Base stations take tens of seconds to spin up. Without a cooldown an
-        // impatient second click aborts the boot - same guard as BaseStation.
         setPowerBusy(true);
-        setTimeout(() => setPowerBusy(false), 15000);
 
-        for (const bs of baseStations) {
-            await ChangeBaseStationPowerStatus(bs.id, mode);
+        try {
+            const failures: string[] = [];
+            for (const bs of baseStations) {
+                const result = await ChangeBaseStationPowerStatus(bs.id, mode);
+                if (result != "ok") failures.push(`${bs.name}: ${result}`);
+            }
+
+            if (failures.length) alert(failures.join("\n"));
+        } finally {
+            setPowerBusy(false);
         }
     }
 
