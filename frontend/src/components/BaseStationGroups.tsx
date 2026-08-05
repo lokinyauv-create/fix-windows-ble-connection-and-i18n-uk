@@ -6,6 +6,7 @@ import { useTranslation } from "react-i18next";
 import { AnimatePresence, motion } from "framer-motion";
 import { CirclePower, Settings } from "lucide-preact";
 import { ChangeBaseStationPowerStatus } from "@src/lib/native/index";
+import { isAwake, isUnknown } from "@src/lib/powerState";
 export function BaseStationGroup({ group, id }: { id: string, group: LighthouseGroup }) {
 
     const baseStations = useGroupedLighthouses(id);
@@ -16,10 +17,11 @@ export function BaseStationGroup({ group, id }: { id: string, group: LighthouseG
     const updatePowerState = async (e: MouseEvent) => {
         e.stopPropagation();
 
-        // Base stations that don't support reading their power state report -1,
-        // so treat anything that isn't explicitly awake as asleep.
-        const anyAwake = baseStations.some(bs => bs.power_state === 9 || bs.power_state === 11);
-        const mode = anyAwake ? "sleep" : "awake";
+        // A station we couldn't read counts as "possibly on", so the group
+        // toggle turns everything off first instead of sending a wake command
+        // to stations that are already awake.
+        const anyOn = baseStations.some(bs => isAwake(bs.power_state) || isUnknown(bs.power_state));
+        const mode = anyOn ? "sleep" : "awake";
 
         for (const bs of baseStations) {
             await ChangeBaseStationPowerStatus(bs.id, mode);

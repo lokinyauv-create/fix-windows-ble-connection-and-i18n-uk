@@ -9,11 +9,12 @@ import { useTranslation } from "react-i18next";
 import { ChevronRightIcon, CirclePower, Eye } from "lucide-preact";
 import type { LighthouseStation } from "@src/lib/types/index";
 import { useWebsocketCommunication } from "@src/lib/hooks/useWebsocketCommunication";
+import { isAwake, isUnknown, nextPowerCommand } from "@src/lib/powerState";
 
 
 export function BaseStation({ station, onSelect, selected, editMode }: { station: LighthouseStation, onSelect?: () => void, selected: boolean, editMode?: boolean }) {
 
-    const isAwoke = [0x0B, 0x01, 0x09].includes(station.power_state);
+    const isAwoke = isAwake(station.power_state);
     const send = useWebsocketCommunication();
 
     const [identitfyDisabled, setIdentitfyhDisabled] = useState(false);
@@ -31,14 +32,7 @@ export function BaseStation({ station, onSelect, selected, editMode }: { station
     }
 
     const updatePowerState = async () => {
-        if (isAwoke) {
-            //Sleeping of
-            let result = await ChangeBaseStationPowerStatus(station.id, "sleep");
-            return;
-        }
-
-        //Waking it up
-        await ChangeBaseStationPowerStatus(station.id, "awake");
+        await ChangeBaseStationPowerStatus(station.id, nextPowerCommand(station.power_state));
     }
 
     const { t } = useTranslation();
@@ -48,6 +42,10 @@ export function BaseStation({ station, onSelect, selected, editMode }: { station
         if (station.status == "error") return "error";
 
         if (station.status != "ready") return "preloaded"
+
+        // Don't claim the station is asleep when we simply never managed to
+        // read its power state - show it as unknown instead.
+        if (isUnknown(station.power_state)) return "unknown"
 
         return isAwoke ? "awoke" : "sleep"
     }, [station.power_state, station.status])
@@ -60,7 +58,7 @@ export function BaseStation({ station, onSelect, selected, editMode }: { station
             <div className="flex flex-col gap-[2px] text-[14px]">
                 <span className="flex flex-row gap-[6px] items-center">
                     <span>{station.name} </span>
-                    <StatusCircleIcon class={`data-[status="sleep"]:fill-red-500 data-[status="preloaded"]:fill-blue-500 data-[status="awoke"]:fill-green-500 duration-300`} data-status={baseStationStatus} />
+                    <StatusCircleIcon class={`data-[status="sleep"]:fill-red-500 data-[status="preloaded"]:fill-blue-500 data-[status="awoke"]:fill-green-500 data-[status="unknown"]:fill-neutral-500 duration-300`} data-status={baseStationStatus} />
 
                 </span>
                 <AnimatePresence mode="wait">
