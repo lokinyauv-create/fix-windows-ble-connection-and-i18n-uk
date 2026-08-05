@@ -1,4 +1,5 @@
 import { useRouter } from "preact-router";
+import { useState } from "preact/hooks";
 import { GroupedBaseStations } from "../assets/icons/GroupedBaseStations";
 import { useGroupedLighthouses } from "@src/lib/hooks/useGroupedLighthouses";
 import type { LighthouseGroup } from "@src/lib/types";
@@ -14,8 +15,17 @@ export function BaseStationGroup({ group, id }: { id: string, group: LighthouseG
     const { t } = useTranslation();
 
 
+    const [powerBusy, setPowerBusy] = useState(false);
     const updatePowerState = async (e: MouseEvent) => {
         e.stopPropagation();
+
+        if (powerBusy) return;
+
+        // Base stations take tens of seconds to spin up. Without a cooldown an
+        // impatient second click sends the opposite command mid-boot and they
+        // never come up - see the same guard in BaseStation.
+        setPowerBusy(true);
+        setTimeout(() => setPowerBusy(false), 15000);
 
         // A station we couldn't read counts as "possibly on", so the group
         // toggle turns everything off first instead of sending a wake command
@@ -50,7 +60,7 @@ export function BaseStationGroup({ group, id }: { id: string, group: LighthouseG
             <AnimatePresence>
 
             <motion.div key={"awoke"}>
-                <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={(e) => updatePowerState(e)}>
+                <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={(e) => updatePowerState(e)} disabled={powerBusy}>
                    <CirclePower color="#C6C6C6" strokeWidth={2}  />
                 </button>
             </motion.div>

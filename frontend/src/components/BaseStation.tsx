@@ -31,7 +31,17 @@ export function BaseStation({ station, onSelect, selected, editMode }: { station
         }, 20000)
     }
 
+    const [powerBusy, setPowerBusy] = useState(false);
     const updatePowerState = async () => {
+        if (powerBusy) return;
+
+        // A base station takes tens of seconds to spin up, and hardware that
+        // doesn't report its power state gives us nothing to show for it. With
+        // no feedback an impatient second click reads as "still off" and sends
+        // the opposite command, so the station never finishes booting.
+        setPowerBusy(true);
+        setTimeout(() => setPowerBusy(false), 15000);
+
         await ChangeBaseStationPowerStatus(station.id, nextPowerCommand(station.power_state));
     }
 
@@ -88,7 +98,7 @@ export function BaseStation({ station, onSelect, selected, editMode }: { station
                     : null}
 
                 {!editMode && <motion.div key={"awoke"} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-                    {station.status == "ready" && <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={updatePowerState}>
+                    {station.status == "ready" && <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={updatePowerState} disabled={powerBusy}>
                         <CirclePower color="#C6C6C6" strokeWidth={2} />
                     </button>}
                 </motion.div>}
