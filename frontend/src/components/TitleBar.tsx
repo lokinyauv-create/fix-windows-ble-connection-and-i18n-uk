@@ -13,6 +13,7 @@ import { useSteamVRStatus } from "@src/lib/hooks/useSteamVRStatus";
 import { WebsocketContext } from "@src/lib/context/websocket.context";
 import { usePlatform } from "@src/lib/hooks/usePlatform";
 import { useLighthouseGroups } from "@src/lib/hooks/useLighthouseGroups";
+import { isAwake, isUnknown } from "@src/lib/powerState";
 
 
 
@@ -61,15 +62,15 @@ export function TitleBar() {
 
   
     const toggleAllBaseStations = async () => {
-        // Base stations that don't support reading their power state report -1.
-        // Treat anything that isn't explicitly awake as "asleep" so the button
-        // wakes them up instead of sending another sleep command.
-        const anyAwake = lighthouses.some(c => c.power_state === 9 || c.power_state === 11);
+        // A station we couldn't read counts as "possibly on", so the toggle
+        // turns everything off first rather than sending a wake command to
+        // stations that are already awake.
+        const anyOn = lighthouses.some(c => isAwake(c.power_state) || isUnknown(c.power_state));
 
         // Note: previousSteamVRState tracks SteamVR only. Overwriting it here
         // made a manual toggle flip the automation, so that starting SteamVR
         // afterwards sent "sleep" instead of "awake".
-        if (!anyAwake) {
+        if (!anyOn) {
             console.log("Waking up everything");
             return await bulkUpdate("awake");
         }
