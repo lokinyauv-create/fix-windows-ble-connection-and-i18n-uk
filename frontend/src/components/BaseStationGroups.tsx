@@ -5,9 +5,8 @@ import { useGroupedLighthouses } from "@src/lib/hooks/useGroupedLighthouses";
 import type { LighthouseGroup } from "@src/lib/types";
 import { useTranslation } from "react-i18next";
 import { AnimatePresence, motion } from "framer-motion";
-import { CirclePower, Settings } from "lucide-preact";
+import { Power, PowerOff, Settings } from "lucide-preact";
 import { ChangeBaseStationPowerStatus } from "@src/lib/native/index";
-import { isAwake, isUnknown } from "@src/lib/powerState";
 export function BaseStationGroup({ group, id }: { id: string, group: LighthouseGroup }) {
 
     const baseStations = useGroupedLighthouses(id);
@@ -16,22 +15,18 @@ export function BaseStationGroup({ group, id }: { id: string, group: LighthouseG
 
 
     const [powerBusy, setPowerBusy] = useState(false);
-    const updatePowerState = async (e: MouseEvent) => {
+
+    // Explicit commands rather than one toggle - the app can't read a station's
+    // power state on Windows, so a toggle would have to guess. See BaseStation.
+    const setPower = async (e: MouseEvent, mode: "awake" | "sleep") => {
         e.stopPropagation();
 
         if (powerBusy) return;
 
         // Base stations take tens of seconds to spin up. Without a cooldown an
-        // impatient second click sends the opposite command mid-boot and they
-        // never come up - see the same guard in BaseStation.
+        // impatient second click aborts the boot - same guard as BaseStation.
         setPowerBusy(true);
         setTimeout(() => setPowerBusy(false), 15000);
-
-        // A station we couldn't read counts as "possibly on", so the group
-        // toggle turns everything off first instead of sending a wake command
-        // to stations that are already awake.
-        const anyOn = baseStations.some(bs => isAwake(bs.power_state) || isUnknown(bs.power_state));
-        const mode = anyOn ? "sleep" : "awake";
 
         for (const bs of baseStations) {
             await ChangeBaseStationPowerStatus(bs.id, mode);
@@ -59,9 +54,12 @@ export function BaseStationGroup({ group, id }: { id: string, group: LighthouseG
         <div className="flex flex-row gap-[8px] [&>*]:flex [&>*]:items-center">
             <AnimatePresence>
 
-            <motion.div key={"awoke"}>
-                <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={(e) => updatePowerState(e)} disabled={powerBusy}>
-                   <CirclePower color="#C6C6C6" strokeWidth={2}  />
+            <motion.div key={"awoke"} className="flex flex-row gap-[8px]">
+                <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={(e) => setPower(e, "awake")} disabled={powerBusy} title={t("Turn on")}>
+                   <Power color="#C6C6C6" strokeWidth={2}  />
+                </button>
+                <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={(e) => setPower(e, "sleep")} disabled={powerBusy} title={t("Turn off")}>
+                   <PowerOff color="#C6C6C6" strokeWidth={2}  />
                 </button>
             </motion.div>
 
