@@ -20,15 +20,3 @@ export function isAwake(powerState: number): boolean {
 export function isUnknown(powerState: number): boolean {
     return powerState === POWER_STATE_UNKNOWN;
 }
-
-/**
- * Which command a power toggle should send.
- *
- * A station whose state we don't know is assumed to be on: base stations power
- * on by default, so "unknown" almost always means "on, we just couldn't read
- * it". Sending "awake" to an already-awake station looks like the button does
- * nothing, which is exactly the bug this avoids.
- */
-export function nextPowerCommand(powerState: number): "sleep" | "awake" {
-    return isAwake(powerState) || isUnknown(powerState) ? "sleep" : "awake";
-}

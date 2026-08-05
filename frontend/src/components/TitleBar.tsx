@@ -1,4 +1,4 @@
-import { PowerCircle, SettingsIcon, X, XIcon } from "lucide-preact";
+import { Power, PowerOff, SettingsIcon, X, XIcon } from "lucide-preact";
 import { ChangeBaseStationPowerStatus, UpdateConfigValue } from "@src/lib/native/index";
 import { useContext, useEffect, useState } from "preact/hooks";
 import { AnimatePresence, motion } from 'framer-motion';
@@ -13,7 +13,6 @@ import { useSteamVRStatus } from "@src/lib/hooks/useSteamVRStatus";
 import { WebsocketContext } from "@src/lib/context/websocket.context";
 import { usePlatform } from "@src/lib/hooks/usePlatform";
 import { useLighthouseGroups } from "@src/lib/hooks/useLighthouseGroups";
-import { isAwake, isUnknown } from "@src/lib/powerState";
 
 
 
@@ -62,30 +61,22 @@ export function TitleBar() {
 
   
     const [powerBusy, setPowerBusy] = useState(false);
-    const toggleAllBaseStations = async () => {
+
+    // Explicit commands rather than one toggle - the app can't read a station's
+    // power state on Windows, so a toggle would have to guess. See BaseStation.
+    //
+    // Note: this deliberately doesn't touch previousSteamVRState. That tracks
+    // SteamVR only, and writing to it here made a manual press flip the
+    // automation so the next SteamVR launch sent "sleep" instead of "awake".
+    const setAllPower = async (mode: "awake" | "sleep") => {
         if (powerBusy) return;
 
         // Base stations take tens of seconds to spin up. Without a cooldown an
-        // impatient second click sends the opposite command mid-boot and they
-        // never come up - see the same guard in BaseStation.
+        // impatient second click aborts the boot - same guard as BaseStation.
         setPowerBusy(true);
         setTimeout(() => setPowerBusy(false), 15000);
 
-        // A station we couldn't read counts as "possibly on", so the toggle
-        // turns everything off first rather than sending a wake command to
-        // stations that are already awake.
-        const anyOn = lighthouses.some(c => isAwake(c.power_state) || isUnknown(c.power_state));
-
-        // Note: previousSteamVRState tracks SteamVR only. Overwriting it here
-        // made a manual toggle flip the automation, so that starting SteamVR
-        // afterwards sent "sleep" instead of "awake".
-        if (!anyOn) {
-            console.log("Waking up everything");
-            return await bulkUpdate("awake");
-        }
-
-        console.log("Putting all base station in sleep mode");
-        await bulkUpdate("sleep");
+        await bulkUpdate(mode);
     }
 
     const Quit = async () => {
@@ -132,8 +123,11 @@ export function TitleBar() {
 
 
             </AnimatePresence>
-            <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25" onClick={toggleAllBaseStations} disabled={powerBusy}>
-                <PowerCircle color="#C6C6C6"/>
+            <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25" onClick={() => setAllPower("awake")} disabled={powerBusy} title={t("Turn on")}>
+                <Power color="#C6C6C6"/>
+            </button>
+            <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25" onClick={() => setAllPower("sleep")} disabled={powerBusy} title={t("Turn off")}>
+                <PowerOff color="#C6C6C6"/>
             </button>
             <button onClick={(c) => route("/settings", true)}>
                 {/* <TitleBarSettingsIcon width={16} height={16} fill="#888888" className={`hover:fill-[#1D81FF] duration-200`} /> */}

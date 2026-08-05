@@ -47,5 +47,7 @@
     "Manage Power (Power on)": "Керування живленням (увімкнення)",
     "Wake up base stations on SteamVR Launch": "Будити станції разом із запуском SteamVR",
     "Manage Power (Power Off)": "Керування живленням (вимкнення)",
-    "Power off base stations on SteamVR Exit": "Присипляти станції, коли SteamVR завершує роботу"
+    "Power off base stations on SteamVR Exit": "Присипляти станції, коли SteamVR завершує роботу",
+    "Turn on": "Увімкнути",
+    "Turn off": "Вимкнути"
 }
