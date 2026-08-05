@@ -61,7 +61,16 @@ export function TitleBar() {
     }, [steamVRLaunched]);
 
   
+    const [powerBusy, setPowerBusy] = useState(false);
     const toggleAllBaseStations = async () => {
+        if (powerBusy) return;
+
+        // Base stations take tens of seconds to spin up. Without a cooldown an
+        // impatient second click sends the opposite command mid-boot and they
+        // never come up - see the same guard in BaseStation.
+        setPowerBusy(true);
+        setTimeout(() => setPowerBusy(false), 15000);
+
         // A station we couldn't read counts as "possibly on", so the toggle
         // turns everything off first rather than sending a wake command to
         // stations that are already awake.
@@ -123,7 +132,7 @@ export function TitleBar() {
 
 
             </AnimatePresence>
-            <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25" onClick={toggleAllBaseStations}>
+            <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25" onClick={toggleAllBaseStations} disabled={powerBusy}>
                 <PowerCircle color="#C6C6C6"/>
             </button>
             <button onClick={(c) => route("/settings", true)}>
