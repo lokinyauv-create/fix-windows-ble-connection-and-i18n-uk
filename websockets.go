@@ -101,7 +101,11 @@ func handleLighthouseSocket(w http.ResponseWriter, r *http.Request) {
 
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		// Upgrade already wrote an error response. Carrying on would hand
+		// reader a nil connection and take the whole app down with a nil
+		// dereference - any plain HTTP request to this port would do it.
 		log.Println(err)
+		return
 	}
 
 	go reader(ws)

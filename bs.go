@@ -321,7 +321,24 @@ func (lv *LighthouseV2) Disconnect() {
 	if lv.p == nil {
 		return
 	}
-	err := lv.p.Disconnect()
+
+	device := lv.p
+
+	// Drop every handle to the link before disconnecting. Leaving them in place
+	// meant the app still believed it was connected: writes went to a dead GATT
+	// session and silently "succeeded" on Windows, so power commands did nothing
+	// while the UI happily reported them as applied. It also let Disconnect run
+	// twice on the same released WinRT session, which crashes the process.
+	lv.p = nil
+	lv.service = nil
+	lv.identifyCharacteristic = nil
+	lv.modeCharacteristic = nil
+	lv.powerStateCharacteristic = nil
+	lv.ValidLighthouse = false
+	lv.Status = "preloaded"
+	WEBSOCKET_BROADCAST.Broadcast(prepareIdWithFieldPacket(lv.Id, "lighthouse.update.status", "status", "preloaded"))
+
+	err := device.Disconnect()
 
 	if err != nil {
 		log.Println("Failed to disconnect.")
