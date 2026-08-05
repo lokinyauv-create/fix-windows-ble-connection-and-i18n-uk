@@ -38,14 +38,18 @@ export function BaseStation({ station, onSelect, selected, editMode }: { station
     // on. A toggle would have to guess, and a wrong guess sends the opposite of
     // what was wanted.
     const setPower = async (mode: "awake" | "sleep") => {
+        // Held only while the command is in flight - it can take a while when
+        // the station has to be reconnected first, and overlapping presses
+        // would race. A press with nothing in flight always goes through.
         if (powerBusy) return;
-
-        // A base station takes tens of seconds to spin up and shows nothing for
-        // it here, so an impatient second click used to abort the boot.
         setPowerBusy(true);
-        setTimeout(() => setPowerBusy(false), 15000);
 
-        await ChangeBaseStationPowerStatus(station.id, mode);
+        try {
+            const result = await ChangeBaseStationPowerStatus(station.id, mode);
+            if (result != "ok") alert(result);
+        } finally {
+            setPowerBusy(false);
+        }
     }
 
     const { t } = useTranslation();

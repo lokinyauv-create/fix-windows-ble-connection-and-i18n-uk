@@ -28,12 +28,20 @@ export function TitleBar() {
 
     const { t } = useTranslation();
 
+    // Returns the stations that refused the command rather than reporting them
+    // itself: the manual buttons surface these, while the SteamVR automation
+    // below only logs them - it runs unattended, often with the window hidden,
+    // where a dialog would be stuck behind the tray.
     const bulkUpdate = async (state: "sleep" | "awake", flags: number = 0) => {
-        
+        const failures: string[] = [];
+
         for(const baseStation of lighthouses) {
             if (flags && !((baseStation.managed_flags & flags) > 0)) continue;
-            await ChangeBaseStationPowerStatus(baseStation.id, state);
+            const result = await ChangeBaseStationPowerStatus(baseStation.id, state);
+            if (result != "ok") failures.push(`${baseStation.name}: ${result}`);
         }
+
+        return failures;
     }
 
     useEffect(() => {
@@ -50,12 +58,14 @@ export function TitleBar() {
 
             if (steamVRLaunched) {
                 console.log("Waking up")
-                await bulkUpdate("awake", 2);
+                const failures = await bulkUpdate("awake", 2);
+                if (failures.length) console.error("Failed to wake:", failures);
                 return;
             }
 
             console.log("Putting in sleep mode")
-            await bulkUpdate("sleep", 4);
+            const failures = await bulkUpdate("sleep", 4);
+            if (failures.length) console.error("Failed to sleep:", failures);
         })()
     }, [steamVRLaunched]);
 
@@ -69,14 +79,16 @@ export function TitleBar() {
     // SteamVR only, and writing to it here made a manual press flip the
     // automation so the next SteamVR launch sent "sleep" instead of "awake".
     const setAllPower = async (mode: "awake" | "sleep") => {
+        // Held only while the commands are in flight - see BaseStation.
         if (powerBusy) return;
-
-        // Base stations take tens of seconds to spin up. Without a cooldown an
-        // impatient second click aborts the boot - same guard as BaseStation.
         setPowerBusy(true);
-        setTimeout(() => setPowerBusy(false), 15000);
 
-        await bulkUpdate(mode);
+        try {
+            const failures = await bulkUpdate(mode);
+            if (failures.length) alert(failures.join("\n"));
+        } finally {
+            setPowerBusy(false);
+        }
     }
 
     const Quit = async () => {
