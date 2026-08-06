@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"tinygo.org/x/bluetooth"
@@ -57,6 +58,18 @@ type LighthouseV2 struct {
 	updateAvailable          bool
 }
 
+// connectingBaseStations holds the ids of the stations with a connection
+// attempt currently in flight, so a second pass can tell the difference between
+// "not connected yet" and "nobody is working on it". A base station accepts one
+// connection at a time, so two chains racing on the same one make GATT
+// discovery come back empty for both.
+var connectingBaseStations sync.Map
+
+func BaseStationIsConnecting(id string) bool {
+	_, connecting := connectingBaseStations.Load(id)
+	return connecting
+}
+
 func PreloadBaseStation(config BaseStationConfiguration, wakeUp bool) BaseStation {
 	lh := &LighthouseV2{
 		Name:             config.Name,
@@ -67,7 +80,11 @@ func PreloadBaseStation(config BaseStationConfiguration, wakeUp bool) BaseStatio
 		ValidLighthouse:  false,
 	}
 
-	go connectToPreloadedBaseStation(lh, config, wakeUp, 0)
+	connectingBaseStations.Store(config.Id, struct{}{})
+	go func() {
+		defer connectingBaseStations.Delete(config.Id)
+		connectToPreloadedBaseStation(lh, config, wakeUp, 0)
+	}()
 
 	return lh
 }
