@@ -5,6 +5,7 @@ package main
 
 import (
 	"log"
+	"strings"
 	"time"
 
 	"tinygo.org/x/bluetooth"
@@ -47,7 +48,15 @@ func connectToPreloadedBaseStation(bs *LighthouseV2, config BaseStationConfigura
 		if res.err != nil {
 			log.Printf("Failed to connect to base station: %s %+v", config.Id, res.err)
 
-			time.Sleep(time.Second)
+			if strings.Contains(res.err.Error(), "not found") || strings.Contains(res.err.Error(), "doesn't exist") {
+				// BlueZ only exposes a D-Bus object for devices it has seen, so
+				// connecting by address to a station it hasn't observed fails
+				// until a scan registers it.
+				discoverBaseStation(config.MacAddress, 8*time.Second)
+			} else {
+				time.Sleep(time.Second)
+			}
+
 			connectToPreloadedBaseStation(bs, config, wakeUp, attemp+1)
 			return
 		}

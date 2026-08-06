@@ -115,7 +115,15 @@ func connectToPreloadedBaseStation(bs *LighthouseV2, config BaseStationConfigura
 		if res.err != nil {
 			log.Printf("Failed to connect to base station: %s %+v", config.Id, res.err)
 
-			time.Sleep(time.Second)
+			if strings.Contains(res.err.Error(), "not found") {
+				// Windows won't connect by address to a device it hasn't seen
+				// recently, even one sitting right there advertising. A scan
+				// makes it resolvable again.
+				discoverBaseStation(config.MacAddress, 8*time.Second)
+			} else {
+				time.Sleep(time.Second)
+			}
+
 			connectToPreloadedBaseStation(bs, config, wakeUp, attemp+1)
 			return
 		}
