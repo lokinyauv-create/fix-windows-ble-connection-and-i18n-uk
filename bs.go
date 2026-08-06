@@ -70,6 +70,50 @@ func BaseStationIsConnecting(id string) bool {
 	return connecting
 }
 
+// scanMutex keeps discovery passes from overlapping each other. Scanning while
+// another station is enumerating its GATT services is what made discovery hang
+// on Windows, so a scan is kept as short as it can be and never runs twice at
+// once.
+var scanMutex sync.Mutex
+
+// discoverBaseStation scans until the given address shows up, so the OS can
+// resolve it. Both backends refuse to connect by address to a device they
+// haven't observed recently - Windows fails outright with "device with the
+// given address was not found", BlueZ with a missing D-Bus object - and a
+// station that was simply idle long enough falls into that state even though
+// it is powered on and advertising normally.
+func discoverBaseStation(mac string, timeout time.Duration) bool {
+	scanMutex.Lock()
+	defer scanMutex.Unlock()
+
+	log.Printf("Scanning so the adapter can resolve %s...\n", mac)
+
+	found := make(chan struct{})
+	var once sync.Once
+
+	go adapter.Scan(func(a *bluetooth.Adapter, sr bluetooth.ScanResult) {
+		if strings.EqualFold(sr.Address.String(), mac) {
+			once.Do(func() { close(found) })
+		}
+	})
+
+	seen := false
+	select {
+	case <-found:
+		seen = true
+	case <-time.After(timeout):
+	}
+
+	adapter.StopScan()
+
+	// Let the radio settle before the connect attempt - overlapping the two is
+	// exactly what breaks service discovery.
+	time.Sleep(500 * time.Millisecond)
+
+	log.Printf("Scan for %s finished, found: %v\n", mac, seen)
+	return seen
+}
+
 func PreloadBaseStation(config BaseStationConfiguration, wakeUp bool) BaseStation {
 	lh := &LighthouseV2{
 		Name:             config.Name,
