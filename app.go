@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -58,14 +59,19 @@ func (a *App) UpdateConfigValue(name string, value interface{}) {
 }
 func (a *App) startup(ctx context.Context) {
 
-	if !strings.Contains(VERSION_FLAGS, "DEBUG") {
-		f, err := os.OpenFile(path.Join(GetConfigFolder(), "log.txt"), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
-		if err != nil {
-			log.Fatalf("error opening file: %v", err)
-		}
-		defer f.Close()
-
-		log.SetOutput(f)
+	// Always keep a log file, and deliberately never close it. This used to be
+	// skipped entirely for DEBUG builds and, worse, the handle was closed as
+	// soon as startup returned - so log.txt only ever held the first few lines
+	// and a problem that showed up later left no trace at all. That matters
+	// most when SteamVR auto-launches us, because then there is no console to
+	// read either.
+	if f, err := os.OpenFile(path.Join(GetConfigFolder(), "log.txt"), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666); err != nil {
+		log.Printf("Failed to open log file, logging to stdout only: %v\n", err)
+	} else {
+		// File first: MultiWriter stops at the first writer that errors, and a
+		// GUI process launched without a console (SteamVR does exactly that)
+		// has no usable stdout - putting it first swallowed the whole log.
+		log.SetOutput(io.MultiWriter(f, os.Stdout))
 	}
 
 	log.Printf("Version flags: %s\n", VERSION_FLAGS)
@@ -339,6 +345,20 @@ func (a *App) preloadBaseStations() {
 
 	steamVrRunning, _ := isProcRunning("vrserver.exe")
 	for name, baseStation := range config.KnownBaseStations {
+		// Don't start a second attempt on a station that is already connected
+		// or already being connected to. A power command arriving while the
+		// startup pass is still running used to trigger a whole second pass
+		// through ReconnectBaseStations, and the two chains then fought over
+		// the station's single BLE link: one got the characteristics, the other
+		// got an empty list, and both churned until they gave up.
+		if existing, ok := knownBaseStations.Get(name); ok && existing != nil && (*existing).GetStatus() == "ready" {
+			continue
+		}
+
+		if BaseStationIsConnecting(baseStation.Id) {
+			continue
+		}
+
 		log.Printf("Preload base station: %s %+v\n", name, baseStation)
 		preloadedBaseStation := PreloadBaseStation(*baseStation, steamVrRunning && ((baseStation.ManagedFlags&2) > 0))
 		knownBaseStations.Set(name, &preloadedBaseStation)
@@ -547,9 +567,12 @@ func ScanCallback(app *App, a *bluetooth.Adapter, sr bluetooth.ScanResult) {
 }
 
 func (a *App) ChangeBaseStationPowerStatus(baseStationMac string, status string) string {
+	log.Printf("Power command requested: %s -> %s\n", baseStationMac, status)
+
 	baseStation, found := knownBaseStations.Get(baseStationMac)
 
 	if !found {
+		log.Printf("Power command failed, %s is not a known base station\n", baseStationMac)
 		return "Unknown base station"
 	}
 
