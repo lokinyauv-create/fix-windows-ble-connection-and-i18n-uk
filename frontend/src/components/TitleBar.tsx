@@ -1,5 +1,5 @@
 import { Power, PowerOff, SettingsIcon, X, XIcon } from "lucide-preact";
-import { ChangeBaseStationPowerStatus, UpdateConfigValue } from "@src/lib/native/index";
+import { ChangeBaseStationPowerStatus, IsSteamVRConnected, Shutdown, UpdateConfigValue } from "@src/lib/native/index";
 import { useContext, useEffect, useState } from "preact/hooks";
 import { AnimatePresence, motion } from 'framer-motion';
 import { PowerStatusIcon } from "../assets/icons/PowerStatusIcon";
@@ -66,6 +66,23 @@ export function TitleBar() {
             console.log("Putting in sleep mode")
             const failures = await bulkUpdate("sleep", 4);
             if (failures.length) console.error("Failed to sleep:", failures);
+
+            // The VR session is over and the stations have been put to sleep,
+            // so there is nothing left to stay resident for. Quitting here
+            // rather than on the SteamVR event itself matters: exiting first
+            // would kill the sleep commands halfway through, and SteamVR
+            // launches us again on the next session anyway.
+            //
+            // Quitting can't be undone, so confirm against the process itself
+            // rather than trusting the socket - putting the stations to sleep
+            // takes a while, and SteamVR may well be back up by now.
+            if (await IsSteamVRConnected()) {
+                console.log("SteamVR is running again, staying up")
+                return;
+            }
+
+            console.log("SteamVR exited, shutting down")
+            await Shutdown();
         })()
     }, [steamVRLaunched]);
 
