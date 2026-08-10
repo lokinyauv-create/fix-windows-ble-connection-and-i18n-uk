@@ -10,6 +10,14 @@ export const ChangeBaseStationPowerStatus = async (id: string, mode: "sleep" | "
     return native.ChangeBaseStationPowerStatus(id, mode);
 }
 
+export const Shutdown = async () => {
+    return native.Shutdown();
+}
+
+export const IsSteamVRConnected = async (): Promise<boolean> => {
+    return native.IsSteamVRConnected();
+}
+
 export const RenameGroup = async (old: string, newName: string) => {
     return native.RenameGroup(old, newName);
 }
