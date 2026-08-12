@@ -118,7 +118,6 @@ func (a *App) startup(ctx context.Context) {
 	go StartHttp()
 
 	a.watchForTermination()
-	a.releaseWhenIdle()
 }
 
 // disconnectAllBaseStations drops every live BLE link we hold. A base station
@@ -147,20 +146,18 @@ func anyBaseStationConnected() bool {
 	return false
 }
 
-// HideToTray hides the window and lets go of the base stations. Sitting in the
-// tray holding them would keep them unusable from any other machine, and we
-// don't need the links until the window comes back or a VR session starts.
+// HideToTray hides the window, keeping the base station links.
+//
+// It used to hand the stations back here so they'd stay usable from another
+// machine, but disconnecting mid-life poisons the process: tinygo's Windows
+// Disconnect returns early when closing the GATT session fails, so the device
+// handle is never closed and every later connect comes back with the service
+// but no characteristics. The app quits when SteamVR exits now, and that
+// releases the stations just as well - a process on its way out can't be
+// poisoned by a failed disconnect.
 func (a *App) HideToTray() {
 	a.windowHidden.Store(true)
 	wruntime.WindowHide(a.ctx)
-
-	if running, _ := isProcRunning("vrserver.exe"); running {
-		// A session is live - the automation still needs the links.
-		return
-	}
-
-	log.Println("Hidden to tray with no VR session - releasing base stations")
-	disconnectAllBaseStations()
 }
 
 // ShowFromTray brings the window back and re-establishes any link we dropped
@@ -192,33 +189,6 @@ func (a *App) ReconnectBaseStations() {
 		// preloadBaseStations only kicks off the connection goroutines, so give
 		// them a moment before another caller is allowed to retry.
 		time.Sleep(10 * time.Second)
-	}()
-}
-
-// releaseWhenIdle drops the BLE links whenever the app is sitting in the tray
-// with no VR session running - e.g. after SteamVR exits and the stations have
-// been put to sleep. Without this the app would keep them claimed for as long
-// as it stays in the tray.
-func (a *App) releaseWhenIdle() {
-	go func() {
-		for {
-			time.Sleep(15 * time.Second)
-
-			if !a.windowHidden.Load() {
-				continue
-			}
-
-			if running, _ := isProcRunning("vrserver.exe"); running {
-				continue
-			}
-
-			if !anyBaseStationConnected() {
-				continue
-			}
-
-			log.Println("Idle in tray with no VR session - releasing base stations")
-			disconnectAllBaseStations()
-		}
 	}()
 }
 
