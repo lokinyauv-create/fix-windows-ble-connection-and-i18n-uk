@@ -1,0 +1,19 @@
+#!/bin/bash
+# Запускає SteamVR Room Setup так, щоб він не падав на Linux/AMD (Mesa RADV). SteamVR має бути запущений.
+# Додаткові аргументи передаються Room Setup. Докладніше: mods/play-area/README.md.
+#
+# Що робить:
+#  1) VK_LAYER_vrfix_mipclamp: виправляє недійсну кількість мипмапів у vkCreateImage (Unity 5.6 просить 7 рівнів
+#     для зображення 50x32, дозволено 6), на чому Mesa зупиняє програму сигналом SIGTRAP.
+#  2) VK_LAYER_LUNARG_envextensions_layer (від SteamVR) + список розширень: те, що SteamVR додає сам, коли
+#     запускає Room Setup зсередини; при ручному запуску цього нема, і vrclient викликає функції, яких немає.
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+SV="$HOME/.local/share/Steam/steamapps/common/SteamVR"
+
+export VK_ADD_LAYER_PATH="$DIR:$SV/bin/linux64${VK_ADD_LAYER_PATH:+:$VK_ADD_LAYER_PATH}"
+export VK_LOADER_LAYERS_ENABLE="VK_LAYER_vrfix_mipclamp,VK_LAYER_LUNARG_envextensions_layer${VK_LOADER_LAYERS_ENABLE:+,$VK_LOADER_LAYERS_ENABLE}"
+
+export VK_ENVEXTENSIONS_INSTANCE_APPEND="VK_KHR_get_physical_device_properties2:VK_KHR_external_memory_capabilities:VK_KHR_external_semaphore_capabilities:VK_KHR_external_fence_capabilities"
+export VK_ENVEXTENSIONS_DEVICE_APPEND="VK_KHR_external_memory:VK_KHR_external_semaphore:VK_KHR_external_memory_fd:VK_KHR_external_semaphore_fd:VK_EXT_external_memory_dma_buf:VK_KHR_dedicated_allocation:VK_KHR_get_memory_requirements2:VK_KHR_timeline_semaphore"
+
+exec "$SV/tools/steamvr_room_setup/linux64/steamvr_room_setup.sh" -popupwindow "$@"
