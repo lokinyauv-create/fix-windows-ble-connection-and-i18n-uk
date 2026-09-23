@@ -269,7 +269,7 @@ func AddToStartup() {
 
 	//Appending it to appconfig.json
 
-	fp := os.ExpandEnv("${ProgramFiles(x86)}\\Steam\\config\\appconfig.json")
+	fp := path.Join(steamConfigDir(), "appconfig.json")
 
 	fileBytes, err := os.ReadFile(fp)
 
@@ -301,13 +301,13 @@ func AddToStartup() {
 		panic("Failed to write new appconfig.")
 	}
 
-	fp = os.ExpandEnv("${ProgramFiles(x86)}\\Steam\\config\\vrappconfig")
+	fp = path.Join(steamConfigDir(), "vrappconfig")
 
 	_ = os.WriteFile(path.Join(fp, "com.github.dhcpcd9.base-station-manager.vrappconfig"), []byte(vrappconfig), 0644)
 }
 
 func RemoveFromStartup() {
-	fp := os.ExpandEnv("${ProgramFiles(x86)}\\Steam\\config\\vrappconfig\\com.github.dhcpcd9.base-station-manager.vrappconfig")
+	fp := path.Join(steamConfigDir(), "vrappconfig", "com.github.dhcpcd9.base-station-manager.vrappconfig")
 
 	if err := os.Remove(fp); err != nil {
 		log.Println("Failed to write config.")
@@ -315,7 +315,7 @@ func RemoveFromStartup() {
 }
 
 func GetSteamVRInstalled() bool {
-	fp := os.ExpandEnv("${ProgramFiles(x86)}\\Steam\\config\\appconfig.json")
+	fp := path.Join(steamConfigDir(), "appconfig.json")
 
 	_, err := os.ReadFile(fp)
 
