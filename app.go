@@ -482,7 +482,7 @@ func (a *App) IsSteamVRConnectivityAvailable() bool {
 }
 
 func (a *App) IsSteamVRConnected() bool {
-	if runtime.GOOS != "windows" {
+	if runtime.GOOS != "windows" && runtime.GOOS != "linux" {
 		return false
 	}
 
