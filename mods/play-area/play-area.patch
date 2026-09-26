@@ -1,0 +1,1927 @@
+From 83df3d305fe16d5d49ce891265152b678bbeefeb Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Mon, 21 Sep 2026 20:58:11 +0200
+Subject: [PATCH 1/4] feat(tools): launcher that keeps SteamVR Room Setup from
+ crashing on Linux/AMD
+
+Room Setup (Unity 5.6) creates a 50x32 image with 7 mip levels; Vulkan allows 6, and Mesa RADV traps (SIGTRAP in Addr2ComputeSurfaceInfo). The VK_LAYER_vrfix_mipclamp layer clamps mipLevels in vkCreateImage/vkCreateImageView and stubs the VK_EXT_debug_utils calls vrclient makes without a NULL check. vr-room-setup also enables SteamVR's envextensions layer with the external memory/semaphore extensions SteamVR adds itself when it launches Room Setup, so a manual launch works.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../VkLayer_vrfix_mipclamp.json               |  14 +
+ tools/room-setup-fix/build.sh                 |   7 +
+ tools/room-setup-fix/mipclamp_layer.c         | 307 ++++++++++++++++++
+ tools/room-setup-fix/vr-room-setup            |  19 ++
+ 4 files changed, 347 insertions(+)
+ create mode 100644 tools/room-setup-fix/VkLayer_vrfix_mipclamp.json
+ create mode 100755 tools/room-setup-fix/build.sh
+ create mode 100644 tools/room-setup-fix/mipclamp_layer.c
+ create mode 100755 tools/room-setup-fix/vr-room-setup
+
+diff --git a/tools/room-setup-fix/VkLayer_vrfix_mipclamp.json b/tools/room-setup-fix/VkLayer_vrfix_mipclamp.json
+new file mode 100644
+index 0000000..b32ec59
+--- /dev/null
++++ b/tools/room-setup-fix/VkLayer_vrfix_mipclamp.json
+@@ -0,0 +1,14 @@
++{
++    "file_format_version": "1.2.0",
++    "layer": {
++        "name": "VK_LAYER_vrfix_mipclamp",
++        "type": "GLOBAL",
++        "library_path": "./libVkLayer_vrfix_mipclamp.so",
++        "api_version": "1.3.0",
++        "implementation_version": "1",
++        "description": "Clamps invalid mipLevels in vkCreateImage (SteamVR Room Setup, Unity 5.6) so RADV does not trap",
++        "functions": {
++            "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
++        }
++    }
++}
+diff --git a/tools/room-setup-fix/build.sh b/tools/room-setup-fix/build.sh
+new file mode 100755
+index 0000000..5e269d8
+--- /dev/null
++++ b/tools/room-setup-fix/build.sh
+@@ -0,0 +1,7 @@
++#!/bin/bash
++# Builds the Vulkan layer used by vr-room-setup. Needs gcc and vulkan-headers
++# (/usr/include/vulkan/vk_layer.h).
++set -e
++cd "$(dirname "$(readlink -f "$0")")"
++gcc -O2 -fPIC -shared -Wall -Wextra -fvisibility=hidden -o libVkLayer_vrfix_mipclamp.so mipclamp_layer.c
++echo "built: $(pwd)/libVkLayer_vrfix_mipclamp.so"
+diff --git a/tools/room-setup-fix/mipclamp_layer.c b/tools/room-setup-fix/mipclamp_layer.c
+new file mode 100644
+index 0000000..cf5e9da
+--- /dev/null
++++ b/tools/room-setup-fix/mipclamp_layer.c
+@@ -0,0 +1,307 @@
++// VK_LAYER_vrfix_mipclamp
++//
++// SteamVR Room Setup (Unity 5.6) calls vkCreateImage with more mip levels than the Vulkan spec allows
++// (e.g. 50x32 with mipLevels=7, max valid is floor(log2(50))+1 = 6). Mesa's RADV (this build, 26.2.2
++// freeworld) then hits an assertion in addrlib (Addr2::V2::Lib::ComputeSurfaceInfo) and raises SIGTRAP.
++//
++// This layer clamps mipLevels in vkCreateImage to the valid maximum, and clamps the mip range of
++// vkCreateImageView for the images it changed. Anything it touches is logged to stderr once per size.
++//
++// Build: see build.sh. Enable per process with the environment (see vr-room-setup).
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++#include <vulkan/vk_layer.h>
++
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define EXPORT __attribute__((visibility("default")))
++
++typedef struct {
++    void *key;
++    PFN_vkGetInstanceProcAddr gipa;
++    PFN_vkDestroyInstance destroy;
++} InstData;
++
++typedef struct {
++    void *key;
++    PFN_vkGetDeviceProcAddr gdpa;
++    PFN_vkDestroyDevice destroy;
++    PFN_vkCreateImage create_image;
++    PFN_vkCreateImageView create_view;
++} DevData;
++
++typedef struct {
++    VkImage image;
++    uint32_t mips;
++} Clamped;
++
++#define MAX_INST 16
++#define MAX_DEV 16
++#define MAX_CLAMPED 4096
++
++static InstData g_inst[MAX_INST];
++static int g_ninst;
++static DevData g_dev[MAX_DEV];
++static int g_ndev;
++static Clamped g_clamped[MAX_CLAMPED];
++static int g_nclamped;
++static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
++
++#define KEY(obj) (*(void **)(obj))
++
++static InstData *find_inst(void *handle) {
++    InstData *r = NULL;
++    if (!handle) return NULL;
++    pthread_mutex_lock(&g_lock);
++    for (int i = 0; i < g_ninst; i++)
++        if (g_inst[i].key == KEY(handle)) { r = &g_inst[i]; break; }
++    pthread_mutex_unlock(&g_lock);
++    return r;
++}
++
++static DevData *find_dev(void *handle) {
++    DevData *r = NULL;
++    if (!handle) return NULL;
++    pthread_mutex_lock(&g_lock);
++    for (int i = 0; i < g_ndev; i++)
++        if (g_dev[i].key == KEY(handle)) { r = &g_dev[i]; break; }
++    pthread_mutex_unlock(&g_lock);
++    return r;
++}
++
++static uint32_t max_valid_levels(const VkImageCreateInfo *ci) {
++    uint32_t m = ci->extent.width;
++    if (ci->extent.height > m) m = ci->extent.height;
++    if (ci->extent.depth > m) m = ci->extent.depth;
++    uint32_t n = 1;
++    while (m > 1) { m >>= 1; n++; }
++    return n;
++}
++
++static void remember(VkImage image, uint32_t mips) {
++    pthread_mutex_lock(&g_lock);
++    if (g_nclamped < MAX_CLAMPED) {
++        g_clamped[g_nclamped].image = image;
++        g_clamped[g_nclamped].mips = mips;
++        g_nclamped++;
++    }
++    pthread_mutex_unlock(&g_lock);
++}
++
++static uint32_t lookup(VkImage image) {
++    uint32_t r = 0;
++    pthread_mutex_lock(&g_lock);
++    for (int i = 0; i < g_nclamped; i++)
++        if (g_clamped[i].image == image) { r = g_clamped[i].mips; break; }
++    pthread_mutex_unlock(&g_lock);
++    return r;
++}
++
++static void log_once(const char *what, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
++    static struct { char w[24]; uint32_t v[4]; } seen[64];
++    static int n;
++    pthread_mutex_lock(&g_lock);
++    for (int i = 0; i < n; i++)
++        if (!strcmp(seen[i].w, what) && seen[i].v[0] == a && seen[i].v[1] == b && seen[i].v[2] == c && seen[i].v[3] == d) {
++            pthread_mutex_unlock(&g_lock);
++            return;
++        }
++    if (n < 64) {
++        strncpy(seen[n].w, what, 23);
++        seen[n].v[0] = a; seen[n].v[1] = b; seen[n].v[2] = c; seen[n].v[3] = d;
++        n++;
++    }
++    pthread_mutex_unlock(&g_lock);
++    fprintf(stderr, "[mipclamp] %s: %u %u %u %u\n", what, a, b, c, d);
++}
++
++// ---- hooks ----------------------------------------------------------------------------------
++
++static VKAPI_ATTR VkResult VKAPI_CALL hook_CreateImage(VkDevice device, const VkImageCreateInfo *pCI,
++                                                        const VkAllocationCallbacks *pA, VkImage *pImage) {
++    DevData *d = find_dev(device);
++    VkImageCreateInfo ci = *pCI;
++    uint32_t maxl = max_valid_levels(pCI);
++    int clamped = 0;
++    if (ci.mipLevels > maxl) {
++        log_once("vkCreateImage extent/mips->max", ci.extent.width, ci.extent.height, ci.mipLevels, maxl);
++        ci.mipLevels = maxl;
++        clamped = 1;
++    }
++    VkResult r = d->create_image(device, &ci, pA, pImage);
++    if (r == VK_SUCCESS && clamped) remember(*pImage, ci.mipLevels);
++    return r;
++}
++
++static VKAPI_ATTR VkResult VKAPI_CALL hook_CreateImageView(VkDevice device, const VkImageViewCreateInfo *pCI,
++                                                            const VkAllocationCallbacks *pA, VkImageView *pView) {
++    DevData *d = find_dev(device);
++    VkImageViewCreateInfo ci = *pCI;
++    uint32_t mips = lookup(ci.image);
++    if (mips && ci.subresourceRange.levelCount != VK_REMAINING_MIP_LEVELS &&
++        ci.subresourceRange.baseMipLevel + ci.subresourceRange.levelCount > mips) {
++        log_once("vkCreateImageView base/count->mips", ci.subresourceRange.baseMipLevel, ci.subresourceRange.levelCount, mips, 0);
++        if (ci.subresourceRange.baseMipLevel >= mips) ci.subresourceRange.baseMipLevel = mips - 1;
++        ci.subresourceRange.levelCount = mips - ci.subresourceRange.baseMipLevel;
++    }
++    return d->create_view(device, &ci, pA, pView);
++}
++
++static VKAPI_ATTR void VKAPI_CALL hook_DestroyDevice(VkDevice device, const VkAllocationCallbacks *pA) {
++    DevData *d = find_dev(device);
++    PFN_vkDestroyDevice destroy = d->destroy;
++    pthread_mutex_lock(&g_lock);
++    for (int i = 0; i < g_ndev; i++)
++        if (&g_dev[i] == d) { g_dev[i] = g_dev[--g_ndev]; break; }
++    pthread_mutex_unlock(&g_lock);
++    destroy(device, pA);
++}
++
++static VKAPI_ATTR void VKAPI_CALL hook_DestroyInstance(VkInstance instance, const VkAllocationCallbacks *pA) {
++    InstData *i = find_inst(instance);
++    PFN_vkDestroyInstance destroy = i->destroy;
++    pthread_mutex_lock(&g_lock);
++    for (int k = 0; k < g_ninst; k++)
++        if (&g_inst[k] == i) { g_inst[k] = g_inst[--g_ninst]; break; }
++    pthread_mutex_unlock(&g_lock);
++    destroy(instance, pA);
++}
++
++static VKAPI_ATTR VkResult VKAPI_CALL hook_CreateInstance(const VkInstanceCreateInfo *pCI,
++                                                           const VkAllocationCallbacks *pA, VkInstance *pInstance) {
++    VkLayerInstanceCreateInfo *chain = (VkLayerInstanceCreateInfo *)pCI->pNext;
++    while (chain && !(chain->sType == VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO && chain->function == VK_LAYER_LINK_INFO))
++        chain = (VkLayerInstanceCreateInfo *)chain->pNext;
++    if (!chain) return VK_ERROR_INITIALIZATION_FAILED;
++
++    PFN_vkGetInstanceProcAddr next_gipa = chain->u.pLayerInfo->pfnNextGetInstanceProcAddr;
++    chain->u.pLayerInfo = chain->u.pLayerInfo->pNext;
++    PFN_vkCreateInstance create = (PFN_vkCreateInstance)next_gipa(VK_NULL_HANDLE, "vkCreateInstance");
++    VkResult r = create(pCI, pA, pInstance);
++    if (r != VK_SUCCESS) return r;
++
++    pthread_mutex_lock(&g_lock);
++    if (g_ninst < MAX_INST) {
++        g_inst[g_ninst].key = KEY(*pInstance);
++        g_inst[g_ninst].gipa = next_gipa;
++        g_inst[g_ninst].destroy = (PFN_vkDestroyInstance)next_gipa(*pInstance, "vkDestroyInstance");
++        g_ninst++;
++    }
++    pthread_mutex_unlock(&g_lock);
++    return VK_SUCCESS;
++}
++
++static VKAPI_ATTR VkResult VKAPI_CALL hook_CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *pCI,
++                                                         const VkAllocationCallbacks *pA, VkDevice *pDevice) {
++    VkLayerDeviceCreateInfo *chain = (VkLayerDeviceCreateInfo *)pCI->pNext;
++    while (chain && !(chain->sType == VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO && chain->function == VK_LAYER_LINK_INFO))
++        chain = (VkLayerDeviceCreateInfo *)chain->pNext;
++    if (!chain) return VK_ERROR_INITIALIZATION_FAILED;
++
++    PFN_vkGetInstanceProcAddr next_gipa = chain->u.pLayerInfo->pfnNextGetInstanceProcAddr;
++    PFN_vkGetDeviceProcAddr next_gdpa = chain->u.pLayerInfo->pfnNextGetDeviceProcAddr;
++    chain->u.pLayerInfo = chain->u.pLayerInfo->pNext;
++    PFN_vkCreateDevice create = (PFN_vkCreateDevice)next_gipa(VK_NULL_HANDLE, "vkCreateDevice");
++    VkResult r = create(pd, pCI, pA, pDevice);
++    if (r != VK_SUCCESS) return r;
++
++    pthread_mutex_lock(&g_lock);
++    if (g_ndev < MAX_DEV) {
++        g_dev[g_ndev].key = KEY(*pDevice);
++        g_dev[g_ndev].gdpa = next_gdpa;
++        g_dev[g_ndev].destroy = (PFN_vkDestroyDevice)next_gdpa(*pDevice, "vkDestroyDevice");
++        g_dev[g_ndev].create_image = (PFN_vkCreateImage)next_gdpa(*pDevice, "vkCreateImage");
++        g_dev[g_ndev].create_view = (PFN_vkCreateImageView)next_gdpa(*pDevice, "vkCreateImageView");
++        g_ndev++;
++    }
++    pthread_mutex_unlock(&g_lock);
++    return VK_SUCCESS;
++}
++
++// ---- proc addr plumbing ---------------------------------------------------------------------
++
++// Some clients (SteamVR's vrclient.so) fetch VK_EXT_debug_utils entry points through vkGetInstanceProcAddr
++// and call them without a NULL check. The loader normally provides them; when they reach us and the next
++// layer has none, hand back harmless no-op stubs instead of NULL.
++static VKAPI_ATTR VkResult VKAPI_CALL stub_result(void) { return VK_SUCCESS; }
++static VKAPI_ATTR void VKAPI_CALL stub_void(void) {}
++
++static PFN_vkVoidFunction debug_utils_stub(const char *name) {
++    if (!strncmp(name, "vkSetDebugUtilsObject", 21)) return (PFN_vkVoidFunction)stub_result;
++    if (strstr(name, "DebugUtilsLabelEXT")) return (PFN_vkVoidFunction)stub_void;
++    return NULL;
++}
++
++static void log_null(const char *who, const char *name) {
++    static char seen[128][72];
++    static int n;
++    static int debug = -1;
++    if (debug < 0) debug = getenv("MIPCLAMP_DEBUG") != NULL;
++    if (!debug) return;
++    pthread_mutex_lock(&g_lock);
++    for (int i = 0; i < n; i++)
++        if (!strncmp(seen[i], name, 71)) { pthread_mutex_unlock(&g_lock); return; }
++    if (n < 128) { strncpy(seen[n], name, 71); n++; }
++    pthread_mutex_unlock(&g_lock);
++    fprintf(stderr, "[mipclamp] %s returned NULL for %s\n", who, name);
++}
++
++// MIPCLAMP_TRACE=1: log every proc-addr lookup for names matching the substring in MIPCLAMP_TRACE_FILTER
++static void trace(const char *who, const char *name, PFN_vkVoidFunction f) {
++    static int on = -1;
++    static const char *filter;
++    if (on < 0) { on = getenv("MIPCLAMP_TRACE") != NULL; filter = getenv("MIPCLAMP_TRACE_FILTER"); }
++    if (!on) return;
++    if (filter && !strstr(name, filter)) return;
++    fprintf(stderr, "[mipclamp] %s(%s) -> %p\n", who, name, (void *)f);
++}
++
++static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetDeviceProcAddr(VkDevice device, const char *name);
++
++static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetInstanceProcAddr(VkInstance instance, const char *name) {
++    if (!strcmp(name, "vkCreateInstance")) return (PFN_vkVoidFunction)hook_CreateInstance;
++    if (!strcmp(name, "vkDestroyInstance")) return (PFN_vkVoidFunction)hook_DestroyInstance;
++    if (!strcmp(name, "vkCreateDevice")) return (PFN_vkVoidFunction)hook_CreateDevice;
++    if (!strcmp(name, "vkGetInstanceProcAddr")) return (PFN_vkVoidFunction)layer_GetInstanceProcAddr;
++    if (!strcmp(name, "vkGetDeviceProcAddr")) return (PFN_vkVoidFunction)layer_GetDeviceProcAddr;
++    if (!strcmp(name, "vkDestroyDevice")) return (PFN_vkVoidFunction)hook_DestroyDevice;
++    if (!strcmp(name, "vkCreateImage")) return (PFN_vkVoidFunction)hook_CreateImage;
++    if (!strcmp(name, "vkCreateImageView")) return (PFN_vkVoidFunction)hook_CreateImageView;
++    if (!instance) { log_null("GIPA(instance=NULL)", name); return NULL; }
++    InstData *i = find_inst(instance);
++    if (!i) { log_null("GIPA(unknown instance)", name); return NULL; }
++    PFN_vkVoidFunction f = i->gipa(instance, name);
++    if (!f) f = debug_utils_stub(name);
++    if (!f) log_null("GIPA(next)", name);
++    trace("GIPA", name, f);
++    return f;
++}
++
++static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetDeviceProcAddr(VkDevice device, const char *name) {
++    if (!strcmp(name, "vkGetDeviceProcAddr")) return (PFN_vkVoidFunction)layer_GetDeviceProcAddr;
++    if (!strcmp(name, "vkDestroyDevice")) return (PFN_vkVoidFunction)hook_DestroyDevice;
++    if (!strcmp(name, "vkCreateImage")) return (PFN_vkVoidFunction)hook_CreateImage;
++    if (!strcmp(name, "vkCreateImageView")) return (PFN_vkVoidFunction)hook_CreateImageView;
++    DevData *d = find_dev(device);
++    if (!d) { log_null("GDPA(unknown device)", name); return NULL; }
++    PFN_vkVoidFunction f = d->gdpa(device, name);
++    if (!f) f = debug_utils_stub(name);
++    if (!f) log_null("GDPA(next)", name);
++    trace("GDPA", name, f);
++    return f;
++}
++
++EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface *p) {
++    if (!p || p->sType != LAYER_NEGOTIATE_INTERFACE_STRUCT) return VK_ERROR_INITIALIZATION_FAILED;
++    if (p->loaderLayerInterfaceVersion >= 2) {
++        p->loaderLayerInterfaceVersion = 2;
++        p->pfnGetInstanceProcAddr = layer_GetInstanceProcAddr;
++        p->pfnGetDeviceProcAddr = layer_GetDeviceProcAddr;
++        p->pfnGetPhysicalDeviceProcAddr = NULL;
++    }
++    return VK_SUCCESS;
++}
+diff --git a/tools/room-setup-fix/vr-room-setup b/tools/room-setup-fix/vr-room-setup
+new file mode 100755
+index 0000000..652548c
+--- /dev/null
++++ b/tools/room-setup-fix/vr-room-setup
+@@ -0,0 +1,19 @@
++#!/bin/bash
++# Запускає SteamVR Room Setup так, щоб він не падав на Linux/AMD (Mesa RADV). SteamVR має бути запущений.
++# Додаткові аргументи передаються Room Setup. Докладніше: mods/play-area/README.md.
++#
++# Що робить:
++#  1) VK_LAYER_vrfix_mipclamp: виправляє недійсну кількість мипмапів у vkCreateImage (Unity 5.6 просить 7 рівнів
++#     для зображення 50x32, дозволено 6), на чому Mesa зупиняє програму сигналом SIGTRAP.
++#  2) VK_LAYER_LUNARG_envextensions_layer (від SteamVR) + список розширень: те, що SteamVR додає сам, коли
++#     запускає Room Setup зсередини; при ручному запуску цього нема, і vrclient викликає функції, яких немає.
++DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
++SV="$HOME/.local/share/Steam/steamapps/common/SteamVR"
++
++export VK_ADD_LAYER_PATH="$DIR:$SV/bin/linux64${VK_ADD_LAYER_PATH:+:$VK_ADD_LAYER_PATH}"
++export VK_LOADER_LAYERS_ENABLE="VK_LAYER_vrfix_mipclamp,VK_LAYER_LUNARG_envextensions_layer${VK_LOADER_LAYERS_ENABLE:+,$VK_LOADER_LAYERS_ENABLE}"
++
++export VK_ENVEXTENSIONS_INSTANCE_APPEND="VK_KHR_get_physical_device_properties2:VK_KHR_external_memory_capabilities:VK_KHR_external_semaphore_capabilities:VK_KHR_external_fence_capabilities"
++export VK_ENVEXTENSIONS_DEVICE_APPEND="VK_KHR_external_memory:VK_KHR_external_semaphore:VK_KHR_external_memory_fd:VK_KHR_external_semaphore_fd:VK_EXT_external_memory_dma_buf:VK_KHR_dedicated_allocation:VK_KHR_get_memory_requirements2:VK_KHR_timeline_semaphore"
++
++exec "$SV/tools/steamvr_room_setup/linux64/steamvr_room_setup.sh" -popupwindow "$@"
+-- 
+2.55.0
+
+
+From 8481a91733d985de557db4055c5ef7c1f9aa1454 Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Tue, 22 Sep 2026 00:34:05 +0200
+Subject: [PATCH 2/4] feat(tools): vrchap-io, export/import the live SteamVR
+ play area
+
+A tiny OpenVR client: 'check', 'export' (IVRChaperoneSetup::ExportLiveToBuffer) and 'import' (ImportFromBufferToWorking + CommitWorkingCopy), the same calls Room Setup uses. It refuses to start SteamVR itself (exit code 3 when vrserver isn't running).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/vrchap-io/build.sh      |  21 +++++
+ tools/vrchap-io/vrchap-io.cpp | 140 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 161 insertions(+)
+ create mode 100755 tools/vrchap-io/build.sh
+ create mode 100644 tools/vrchap-io/vrchap-io.cpp
+
+diff --git a/tools/vrchap-io/build.sh b/tools/vrchap-io/build.sh
+new file mode 100755
+index 0000000..2e76418
+--- /dev/null
++++ b/tools/vrchap-io/build.sh
+@@ -0,0 +1,21 @@
++#!/bin/bash
++# Builds vrchap-io, the helper the Room page uses to export/import the live
++# SteamVR play area. Needs g++ and the OpenVR SDK header openvr.h:
++#   OPENVR_INCLUDE=/path/to/openvr/headers ./build.sh
++# Without OPENVR_INCLUDE the header of OpenVR v2.15.6 is downloaded into
++# third_party/. libopenvr_api.so is taken from the SteamVR install
++# (STEAMVR_DIR, default: native Steam's library).
++set -e
++cd "$(dirname "$(readlink -f "$0")")"
++SV="${STEAMVR_DIR:-$HOME/.local/share/Steam/steamapps/common/SteamVR}"
++LIB="$SV/bin/linux64"
++INC="${OPENVR_INCLUDE:-}"
++if [ -z "$INC" ]; then
++    INC=third_party/openvr
++    if [ ! -f "$INC/openvr.h" ]; then
++        mkdir -p "$INC"
++        curl -fsSL -o "$INC/openvr.h" https://raw.githubusercontent.com/ValveSoftware/openvr/v2.15.6/headers/openvr.h
++    fi
++fi
++g++ -O2 -std=c++17 -Wall -Wextra -I "$INC" vrchap-io.cpp -o vrchap-io -L"$LIB" -lopenvr_api -Wl,-rpath,"$LIB"
++echo "built: $(pwd)/vrchap-io"
+diff --git a/tools/vrchap-io/vrchap-io.cpp b/tools/vrchap-io/vrchap-io.cpp
+new file mode 100644
+index 0000000..2a8fa35
+--- /dev/null
++++ b/tools/vrchap-io/vrchap-io.cpp
+@@ -0,0 +1,140 @@
++// vrchap-io: export / import the *live* SteamVR chaperone (play area) through the official OpenVR API,
++// the same way Room Setup does it (IVRChaperoneSetup::ExportLiveToBuffer / ImportFromBufferToWorking).
++//
++//   vrchap-io check              -> exit 0 if the chaperone-setup interface is reachable
++//   vrchap-io export             -> prints the live chaperone JSON to stdout
++//   vrchap-io import <file|->    -> imports JSON (file or stdin) into the working copy and commits it as live
++//                                   add --bounds-only to import only the collision bounds
++//
++// SteamVR must already be running: this helper refuses to start it (exit code 3).
++// Env VRZONES_APPTYPE = background | overlay | utility (default: overlay).
++#include <openvr.h>
++#include <dirent.h>
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <iostream>
++#include <sstream>
++#include <string>
++#include <vector>
++
++using namespace vr;
++
++static bool vrserver_running() {
++    DIR *d = opendir("/proc");
++    if (!d) return false;
++    bool found = false;
++    while (dirent *e = readdir(d)) {
++        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
++        std::string path = std::string("/proc/") + e->d_name + "/comm";
++        std::ifstream f(path);
++        std::string comm;
++        if (f && std::getline(f, comm) && comm == "vrserver") { found = true; break; }
++    }
++    closedir(d);
++    return found;
++}
++
++static EVRApplicationType app_type() {
++    const char *t = getenv("VRZONES_APPTYPE");
++    if (t && !strcmp(t, "background")) return VRApplication_Background;
++    if (t && !strcmp(t, "utility")) return VRApplication_Utility;
++    return VRApplication_Overlay;
++}
++
++int main(int argc, char **argv) {
++    if (argc < 2) {
++        fprintf(stderr, "usage: vrchap-io check | export | import <file|-> [--bounds-only]\n");
++        return 2;
++    }
++    std::string cmd = argv[1];
++
++    if (!vrserver_running()) {
++        fprintf(stderr, "SteamVR is not running (vrserver not found)\n");
++        return 3;
++    }
++
++    EVRInitError err;
++    VR_Init(&err, app_type());
++    if (err != VRInitError_None) {
++        fprintf(stderr, "VR_Init failed: %s\n", VR_GetVRInitErrorAsEnglishDescription(err));
++        return 3;
++    }
++    IVRChaperoneSetup *cs = VRChaperoneSetup();
++    if (!cs) {
++        fprintf(stderr, "IVRChaperoneSetup is not available for this app type\n");
++        VR_Shutdown();
++        return 4;
++    }
++
++    int rc = 0;
++    if (cmd == "check") {
++        printf("ok\n");
++    } else if (cmd == "state") {
++        IVRChaperone *ch = VRChaperone();
++        if (!ch) { fprintf(stderr, "IVRChaperone is not available\n"); rc = 4; }
++        else {
++            int s = (int)ch->GetCalibrationState();
++            const char *name = "unknown";
++            switch (s) {
++                case 1: name = "OK"; break;
++                case 100: name = "Warning"; break;
++                case 101: name = "Warning_BaseStationMayHaveMoved"; break;
++                case 102: name = "Warning_BaseStationRemoved"; break;
++                case 103: name = "Warning_SeatedBoundsInvalid"; break;
++                case 200: name = "Error (UniverseID invalid)"; break;
++                case 201: name = "Error_BaseStationUninitialized"; break;
++                case 202: name = "Error_BaseStationConflict"; break;
++                case 203: name = "Error_PlayAreaInvalid"; break;
++                case 204: name = "Error_CollisionBoundsInvalid"; break;
++            }
++            printf("%d %s\n", s, name);
++        }
++    } else if (cmd == "export") {
++        uint32_t len = 0;
++        cs->ExportLiveToBuffer(nullptr, &len);
++        if (len < 4096) len = 1 << 20;
++        std::vector<char> buf(len + 1, 0);
++        uint32_t cap = len;
++        if (!cs->ExportLiveToBuffer(buf.data(), &cap)) {
++            fprintf(stderr, "ExportLiveToBuffer failed\n");
++            rc = 4;
++        } else {
++            fputs(buf.data(), stdout);
++            fputc('\n', stdout);
++        }
++    } else if (cmd == "import") {
++        if (argc < 3) {
++            fprintf(stderr, "import needs a file or - for stdin\n");
++            rc = 2;
++        } else {
++            std::stringstream ss;
++            if (!strcmp(argv[2], "-")) ss << std::cin.rdbuf();
++            else {
++                std::ifstream f(argv[2]);
++                if (!f) { fprintf(stderr, "cannot open %s\n", argv[2]); VR_Shutdown(); return 2; }
++                ss << f.rdbuf();
++            }
++            std::string json = ss.str();
++            uint32_t flags = 0;
++            for (int i = 3; i < argc; i++)
++                if (!strcmp(argv[i], "--bounds-only")) flags |= EChaperoneImport_BoundsOnly;
++            if (!cs->ImportFromBufferToWorking(json.c_str(), flags)) {
++                fprintf(stderr, "ImportFromBufferToWorking failed (bad JSON or wrong universe?)\n");
++                rc = 4;
++            } else if (!cs->CommitWorkingCopy(EChaperoneConfigFile_Live)) {
++                fprintf(stderr, "CommitWorkingCopy failed\n");
++                rc = 4;
++            } else {
++                printf("applied\n");
++            }
++        }
++    } else {
++        fprintf(stderr, "unknown command: %s\n", cmd.c_str());
++        rc = 2;
++    }
++    VR_Shutdown();
++    return rc;
++}
+-- 
+2.55.0
+
+
+From e700d466e0a9da411d6d158b7827750340a7192d Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Sat, 26 Sep 2026 21:15:00 +0200
+Subject: [PATCH 3/4] feat: Room page - saved play areas, auto re-apply and
+ Room Setup
+
+Folds the standalone vr-zones tool and the Room Setup launcher into the app (Linux; other platforms get stubs):
+- save the current play area under a name, apply / rename / delete it, and
+  mark one zone as "auto" (same ~/.config/vr-zones/zones.json as vr-zones)
+- a watcher started with the app re-applies the auto zone once per SteamVR
+  session and after every base station tilt recalibration ("CALIBRATED base"
+  in vrserver.txt), which is when the floor and bounds drift
+- a button that launches tools/room-setup-fix/vr-room-setup
+- helpers are looked up via BSM_VRCHAP_IO / BSM_ROOM_SETUP, next to the
+  executable, or in the source tree's tools/
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .gitignore                                |   5 +-
+ app.go                                    |   3 +
+ frontend/src/app.tsx                      |   4 +
+ frontend/src/components/TitleBar.tsx      |   5 +-
+ frontend/src/lib/native/index.ts          |  53 +-
+ frontend/src/localization/locales/en.json |  27 +-
+ frontend/src/views/PlayAreaView.tsx       | 162 ++++++
+ frontend/wailsjs/go/main/App.d.ts         |  18 +
+ frontend/wailsjs/go/main/App.js           |  36 ++
+ frontend/wailsjs/go/models.ts             |  43 ++
+ playarea_linux.go                         | 643 ++++++++++++++++++++++
+ playarea_other.go                         |  37 ++
+ 12 files changed, 1029 insertions(+), 7 deletions(-)
+ create mode 100644 frontend/src/views/PlayAreaView.tsx
+ create mode 100644 playarea_linux.go
+ create mode 100644 playarea_other.go
+
+diff --git a/.gitignore b/.gitignore
+index eb7533f..32bef29 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,4 +2,7 @@ build/bin
+ node_modules
+ frontend/dist
+ build/windows/installer
+-log.txt
+\ No newline at end of file
++log.txt
++tools/vrchap-io/vrchap-io
++tools/vrchap-io/third_party
++tools/room-setup-fix/*.so
+diff --git a/app.go b/app.go
+index 8aa0d8b..83239bb 100644
+--- a/app.go
++++ b/app.go
+@@ -67,6 +67,9 @@ func (a *App) startup(ctx context.Context) {
+ 
+ 	a.ctx = ctx
+ 
++	// Keeps the saved play area applied for the whole SteamVR session.
++	startZoneWatcher()
++
+ 	go func() {
+ 		for {
+ 			<-WAKE_UP_CHANNEL
+diff --git a/frontend/src/app.tsx b/frontend/src/app.tsx
+index 03a0093..866a52b 100644
+--- a/frontend/src/app.tsx
++++ b/frontend/src/app.tsx
+@@ -14,6 +14,7 @@ import { GroupedBaseStationSettings } from './views/groups/GroupedBaseStationSet
+ import { useEffect, useRef } from 'preact/hooks';
+ import { WebsocketProvider } from '@src/lib/context/websocket.context.tsx';
+ import { SoftwareUpdatesView } from './views/settings/UpdatesView';
++import { PlayAreaView } from './views/PlayAreaView';
+ 
+ const AnimatedPath = ({ children, path }) => {
+     return (<motion.div key={path} initial={{ opacity: 0, x: -5 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 5 }}>
+@@ -40,6 +41,9 @@ export function App(props) {
+                            <AnimatedPath path={"/settings/updates"}>
+                             <SoftwareUpdatesView />
+                         </AnimatedPath>
++                        <AnimatedPath path={"/room"}>
++                            <PlayAreaView />
++                        </AnimatedPath>
+                         <AnimatedPath path={"/devices/:id"}>
+                             <BaseStationSettingsPage />
+                         </AnimatedPath>
+diff --git a/frontend/src/components/TitleBar.tsx b/frontend/src/components/TitleBar.tsx
+index f286c89..f92aec0 100644
+--- a/frontend/src/components/TitleBar.tsx
++++ b/frontend/src/components/TitleBar.tsx
+@@ -1,4 +1,4 @@
+-import { PowerCircle, SettingsIcon, X, XIcon } from "lucide-preact";
++import { Map as MapIcon, PowerCircle, SettingsIcon, X, XIcon } from "lucide-preact";
+ import { ChangeBaseStationPowerStatus, UpdateConfigValue } from "@src/lib/native/index";
+ import { useContext, useEffect, useState } from "preact/hooks";
+ import { AnimatePresence, motion } from 'framer-motion';
+@@ -114,6 +114,9 @@ export function TitleBar() {
+             <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25" onClick={toggleAllBaseStations}>
+                 <PowerCircle color="#C6C6C6"/>
+             </button>
++            <button className="opacity-75 hover:opacity-100 duration-150" onClick={() => route("/room", true)} title={t("Room")}>
++                <MapIcon color="#888888" />
++            </button>
+             <button onClick={(c) => route("/settings", true)}>
+                 {/* <TitleBarSettingsIcon width={16} height={16} fill="#888888" className={`hover:fill-[#1D81FF] duration-200`} /> */}
+                 <SettingsIcon color="#888888" />
+diff --git a/frontend/src/lib/native/index.ts b/frontend/src/lib/native/index.ts
+index 6a87252..b2ef489 100644
+--- a/frontend/src/lib/native/index.ts
++++ b/frontend/src/lib/native/index.ts
+@@ -71,4 +71,55 @@ export const UpdateBaseStationParam = async (id: string, param: string, value: a
+ 
+ export const RemoveGroup = async (id: string): Promise<void> => {
+     return native.RemoveGroup(id);
+-}
+\ No newline at end of file
++}
++export interface PlayAreaZone {
++    id: string,
++    name: string,
++    play_area: number[] | null,
++    created_at: string,
++    auto_apply: boolean
++}
++
++export interface RoomStatus {
++    supported: boolean,
++    steamvr_running: boolean,
++    helper_found: boolean,
++    room_setup_found: boolean,
++    watcher_running: boolean
++}
++
++export const GetRoomStatus = async (): Promise<RoomStatus> => {
++    return native.GetRoomStatus() as Promise<RoomStatus>;
++}
++
++export const ListZones = async (): Promise<PlayAreaZone[]> => {
++    return (await native.ListZones() ?? []) as PlayAreaZone[];
++}
++
++export const GetZoneLog = async (): Promise<string[]> => {
++    return (await native.GetZoneLog()) ?? [];
++}
++
++export const CaptureZone = async (name: string): Promise<status> => {
++    return native.CaptureZone(name);
++}
++
++export const ApplyZone = async (id: string): Promise<status> => {
++    return native.ApplyZone(id);
++}
++
++export const RenameZone = async (id: string, name: string): Promise<status> => {
++    return native.RenameZone(id, name);
++}
++
++export const DeleteZone = async (id: string): Promise<status> => {
++    return native.DeleteZone(id);
++}
++
++export const SetAutoZone = async (id: string): Promise<status> => {
++    return native.SetAutoZone(id);
++}
++
++export const LaunchRoomSetup = async (): Promise<status> => {
++    return native.LaunchRoomSetup();
++}
+diff --git a/frontend/src/localization/locales/en.json b/frontend/src/localization/locales/en.json
+index 548fb11..493cc64 100644
+--- a/frontend/src/localization/locales/en.json
++++ b/frontend/src/localization/locales/en.json
+@@ -47,7 +47,26 @@
+     "Manage Power (Power on)": "Manage Power (Power on)",
+     "Wake up base stations on SteamVR Launch": "Wake up base stations on SteamVR Launch",
+     "Manage Power (Power Off)": "Manage Power (Power off)",
+-    "Power off base stations on SteamVR Exit": "Power off base stations on SteamVR exit"
+-    
+-
+-}
+\ No newline at end of file
++    "Power off base stations on SteamVR Exit": "Power off base stations on SteamVR exit",
++    "Room": "Room",
++    "Room Setup": "Room Setup",
++    "Room Setup launcher not found": "Room Setup launcher not found",
++    "Calibrate the floor and draw the play area (fixed for Linux/AMD)": "Calibrate the floor and draw the play area (fixed for Linux/AMD)",
++    "Start SteamVR first": "Start SteamVR first",
++    "Room Setup started": "Room Setup started",
++    "Launch": "Launch",
++    "Save current play area": "Save current play area",
++    "Takes the zone SteamVR is using right now": "Takes the zone SteamVR is using right now",
++    "Zone name": "Zone name",
++    "Zone saved": "Zone saved",
++    "Save": "Save",
++    "No saved zones yet": "No saved zones yet",
++    "Apply automatically when SteamVR starts and after base station recalibration": "Apply automatically when SteamVR starts and after base station recalibration",
++    "Auto": "Auto",
++    "Apply now": "Apply now",
++    "Zone applied": "Zone applied",
++    "Rename": "Rename",
++    "Delete": "Delete",
++    "Click again to delete": "Click again to delete",
++    "Waiting for SteamVR...": "Waiting for SteamVR..."
++}
+diff --git a/frontend/src/views/PlayAreaView.tsx b/frontend/src/views/PlayAreaView.tsx
+new file mode 100644
+index 0000000..59e1546
+--- /dev/null
++++ b/frontend/src/views/PlayAreaView.tsx
+@@ -0,0 +1,162 @@
++import { useEffect, useRef, useState } from 'preact/hooks'
++import { motion } from 'framer-motion'
++import { useTranslation } from 'react-i18next';
++import { Check, Pencil, Play, ScanLine, Trash2, X } from 'lucide-preact';
++import { Checkbox } from '../components/Checkbox';
++import { smoothResize } from '../utils/windows';
++import { useContainerTitlebar } from '@src/lib/stores/titlebar.store.ts';
++import {
++    ApplyZone, CaptureZone, DeleteZone, GetRoomStatus, GetZoneLog, LaunchRoomSetup, ListZones,
++    RenameZone, SetAutoZone, type PlayAreaZone, type RoomStatus
++} from '@src/lib/native/index.ts';
++
++const formatArea = (pa: number[] | null) => pa && pa.length >= 2 ? `${pa[0].toFixed(1)} × ${pa[1].toFixed(1)} м` : "?";
++const formatDate = (iso: string) => iso ? iso.replace("T", " ").slice(0, 16) : "";
++
++const iconButton = "opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 disabled:cursor-not-allowed cursor-pointer p-1";
++const primaryButton = "text-[12px] py-[6px] px-[16px] bg-[#1D81FF] rounded-[6px] duration-100 hover:bg-[#66AAFF] cursor-pointer disabled:bg-[#2A63AB] disabled:opacity-60 disabled:cursor-not-allowed";
++const textInput = "h-[26px] bg-[#121212] text-[#C6C6C6] rounded-md text-[12px] px-[12px] focus:outline-none poppins-medium";
++
++export function PlayAreaView() {
++    const { t, i18n } = useTranslation();
++    const { setItems } = useContainerTitlebar();
++    const [status, setStatus] = useState<RoomStatus | null>(null);
++    const [zones, setZones] = useState<PlayAreaZone[]>([]);
++    const [log, setLog] = useState<string[]>([]);
++    const [newName, setNewName] = useState("");
++    const [editing, setEditing] = useState<{ id: string, name: string } | null>(null);
++    const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
++    const [busy, setBusy] = useState(false);
++    const [message, setMessage] = useState<{ text: string, error: boolean } | null>(null);
++    const logRef = useRef<HTMLDivElement>(null);
++
++    const refresh = async () => {
++        const [s, z, l] = await Promise.all([GetRoomStatus(), ListZones(), GetZoneLog()]);
++        setStatus(s);
++        setZones(z.sort((a, b) => a.created_at.localeCompare(b.created_at)));
++        setLog(l);
++    };
++
++    useEffect(() => {
++        smoothResize(700, 560);
++        refresh();
++        const timer = setInterval(refresh, 2000);
++        return () => clearInterval(timer);
++    }, []);
++
++    useEffect(() => {
++        setItems([{ text: "SteamVR LM", link: "/" }, { text: t("Room"), link: "/room" }]);
++    }, [i18n.language]);
++
++    useEffect(() => {
++        if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
++    }, [log.length]);
++
++    // Runs a backend action; its "error: ..." strings end up in the message line.
++    const run = async (action: () => Promise<string>, success?: string) => {
++        setBusy(true);
++        setMessage(null);
++        try {
++            const result = await action();
++            if (result && result !== "ok") {
++                setMessage({ text: result.replace(/^error:\s*/, ""), error: true });
++            } else if (success) {
++                setMessage({ text: success, error: false });
++            }
++        } finally {
++            setBusy(false);
++            await refresh();
++        }
++    };
++
++    const steamvr = status?.steamvr_running ?? false;
++
++    return (<div className="poppins-semibold text-white py-[12px] px-[24px] select-none">
++        <div className='flex flex-col gap-[8px] w-full pt-[8px]'>
++
++            <div className='flex flex-row justify-between items-center w-full bg-[#1F1F1F] p-[14px] rounded-[6px]'>
++                <div className='flex flex-col'>
++                    <span className='text-[14px] poppins-regular'>{t("Room Setup")}</span>
++                    <span className='text-[12px] opacity-80 poppins-regular'>
++                        {!status?.room_setup_found ? t("Room Setup launcher not found")
++                            : steamvr ? t("Calibrate the floor and draw the play area (fixed for Linux/AMD)")
++                                : t("Start SteamVR first")}
++                    </span>
++                </div>
++                <button className={`${primaryButton} flex flex-row items-center gap-[6px]`} disabled={!steamvr || !status?.room_setup_found || busy}
++                    onClick={() => run(LaunchRoomSetup, t("Room Setup started"))}>
++                    <ScanLine size={14} /> {t("Launch")}
++                </button>
++            </div>
++
++            <div className='flex flex-row justify-between items-center w-full bg-[#1F1F1F] p-[14px] rounded-[6px] gap-[12px]'>
++                <div className='flex flex-col'>
++                    <span className='text-[14px] poppins-regular'>{t("Save current play area")}</span>
++                    <span className='text-[12px] opacity-80 poppins-regular'>{steamvr ? t("Takes the zone SteamVR is using right now") : t("Start SteamVR first")}</span>
++                </div>
++                <div className='flex flex-row gap-[8px] items-center'>
++                    <input className={`${textInput} w-[170px]`} maxLength={40} placeholder={t("Zone name")} value={newName}
++                        onInput={(e: any) => setNewName(e.target.value)}
++                        onKeyDown={(e: any) => { if (e.key === "Enter" && newName.trim() && steamvr) run(() => CaptureZone(newName), t("Zone saved")).then(() => setNewName("")) }} />
++                    <button className={primaryButton} disabled={!steamvr || !newName.trim() || busy}
++                        onClick={() => run(() => CaptureZone(newName), t("Zone saved")).then(() => setNewName(""))}>
++                        {t("Save")}
++                    </button>
++                </div>
++            </div>
++
++            <div className='flex flex-col w-full bg-[#1F1F1F] rounded-[6px] py-[6px] max-h-[170px] overflow-y-auto'>
++                {zones.length === 0 && <span className='text-[12px] opacity-60 poppins-regular px-[14px] py-[8px]'>{t("No saved zones yet")}</span>}
++                {zones.map(zone => (
++                    <div key={zone.id} className='flex flex-row justify-between items-center px-[14px] py-[6px] hover:bg-[#262626] duration-100'>
++                        <div className='flex flex-col min-w-0'>
++                            {editing?.id === zone.id ?
++                                <div className='flex flex-row items-center gap-[4px]'>
++                                    <input className={`${textInput} w-[180px]`} maxLength={40} value={editing.name} autoFocus
++                                        onInput={(e: any) => setEditing({ id: zone.id, name: e.target.value })}
++                                        onKeyDown={(e: any) => {
++                                            if (e.key === "Enter") run(() => RenameZone(zone.id, editing.name)).then(() => setEditing(null));
++                                            if (e.key === "Escape") setEditing(null);
++                                        }} />
++                                    <button className={iconButton} onClick={() => run(() => RenameZone(zone.id, editing.name)).then(() => setEditing(null))}><Check size={16} color="#C6C6C6" /></button>
++                                    <button className={iconButton} onClick={() => setEditing(null)}><X size={16} color="#C6C6C6" /></button>
++                                </div>
++                                : <span className='text-[14px] poppins-regular truncate'>{zone.name}</span>}
++                            <span className='text-[11px] opacity-60 poppins-regular'>{formatArea(zone.play_area)} · {formatDate(zone.created_at)}</span>
++                        </div>
++                        <div className='flex flex-row items-center gap-[10px] shrink-0'>
++                            <div className='flex flex-row items-center gap-[6px]' title={t("Apply automatically when SteamVR starts and after base station recalibration")}>
++                                <span className='text-[11px] opacity-70 poppins-regular'>{t("Auto")}</span>
++                                <Checkbox disabled={busy} value={zone.auto_apply} SetValue={(v: boolean) => run(() => SetAutoZone(v ? zone.id : ""))} />
++                            </div>
++                            <button className={iconButton} disabled={!steamvr || busy} title={t("Apply now")} onClick={() => run(() => ApplyZone(zone.id), t("Zone applied"))}>
++                                <Play size={18} color="#C6C6C6" />
++                            </button>
++                            <button className={iconButton} disabled={busy} title={t("Rename")} onClick={() => setEditing({ id: zone.id, name: zone.name })}>
++                                <Pencil size={16} color="#C6C6C6" />
++                            </button>
++                            <button className={iconButton} disabled={busy} title={confirmDelete === zone.id ? t("Click again to delete") : t("Delete")}
++                                onClick={() => {
++                                    if (confirmDelete !== zone.id) {
++                                        setConfirmDelete(zone.id);
++                                        setTimeout(() => setConfirmDelete(c => c === zone.id ? null : c), 3000);
++                                        return;
++                                    }
++                                    setConfirmDelete(null);
++                                    run(() => DeleteZone(zone.id));
++                                }}>
++                                <Trash2 size={16} color={confirmDelete === zone.id ? "#FF7373" : "#C6C6C6"} />
++                            </button>
++                        </div>
++                    </div>
++                ))}
++            </div>
++
++            {message && <motion.span initial={{ opacity: 0 }} animate={{ opacity: 1 }} className={`text-[12px] poppins-regular ${message.error ? "text-[#FF7373]" : "text-[#7CDB8A]"}`}>{message.text}</motion.span>}
++
++            <div ref={logRef} className='w-full bg-[#121212] rounded-[6px] p-[8px] h-[110px] overflow-y-auto text-[11px] text-[#888888] font-mono select-text'>
++                {log.length === 0 ? t("Waiting for SteamVR...") : log.map((line, i) => <div key={i}>{line}</div>)}
++            </div>
++        </div>
++    </div>);
++}
+diff --git a/frontend/wailsjs/go/main/App.d.ts b/frontend/wailsjs/go/main/App.d.ts
+index 3b5ae7a..a287400 100755
+--- a/frontend/wailsjs/go/main/App.d.ts
++++ b/frontend/wailsjs/go/main/App.d.ts
+@@ -4,12 +4,18 @@ import {main} from '../models';
+ 
+ export function AddBaseStationToGroup(arg1:string,arg2:string):Promise<string>;
+ 
++export function ApplyZone(arg1:string):Promise<string>;
++
++export function CaptureZone(arg1:string):Promise<string>;
++
+ export function ChangeBaseStationChannel(arg1:string,arg2:number):Promise<string>;
+ 
+ export function ChangeBaseStationPowerStatus(arg1:string,arg2:string):Promise<string>;
+ 
+ export function CreateGroup(arg1:string,arg2:Array<string>):Promise<string>;
+ 
++export function DeleteZone(arg1:string):Promise<string>;
++
+ export function ForceUpdate():Promise<void>;
+ 
+ export function ForgetBaseStation(arg1:string):Promise<void>;
+@@ -18,8 +24,12 @@ export function GetConfiguration():Promise<main.Configuration>;
+ 
+ export function GetFoundBaseStations():Promise<Record<string, main.JsonBaseStation>>;
+ 
++export function GetRoomStatus():Promise<main.RoomStatus>;
++
+ export function GetVersion():Promise<string>;
+ 
++export function GetZoneLog():Promise<Array<string>>;
++
+ export function IdentitifyBaseStation(arg1:string):Promise<string>;
+ 
+ export function InitBluetooth():Promise<boolean>;
+@@ -30,12 +40,20 @@ export function IsSteamVRConnectivityAvailable():Promise<boolean>;
+ 
+ export function IsUpdatingSupported():Promise<boolean>;
+ 
++export function LaunchRoomSetup():Promise<string>;
++
++export function ListZones():Promise<Array<main.Zone>>;
++
+ export function Notify(arg1:string,arg2:string):Promise<void>;
+ 
+ export function RemoveGroup(arg1:string):Promise<void>;
+ 
+ export function RenameGroup(arg1:string,arg2:string):Promise<string>;
+ 
++export function RenameZone(arg1:string,arg2:string):Promise<string>;
++
++export function SetAutoZone(arg1:string):Promise<string>;
++
+ export function Shutdown():Promise<void>;
+ 
+ export function SleepAllBaseStations():Promise<void>;
+diff --git a/frontend/wailsjs/go/main/App.js b/frontend/wailsjs/go/main/App.js
+index bf0a24a..0de998f 100755
+--- a/frontend/wailsjs/go/main/App.js
++++ b/frontend/wailsjs/go/main/App.js
+@@ -6,6 +6,14 @@ export function AddBaseStationToGroup(arg1, arg2) {
+   return window['go']['main']['App']['AddBaseStationToGroup'](arg1, arg2);
+ }
+ 
++export function ApplyZone(arg1) {
++  return window['go']['main']['App']['ApplyZone'](arg1);
++}
++
++export function CaptureZone(arg1) {
++  return window['go']['main']['App']['CaptureZone'](arg1);
++}
++
+ export function ChangeBaseStationChannel(arg1, arg2) {
+   return window['go']['main']['App']['ChangeBaseStationChannel'](arg1, arg2);
+ }
+@@ -18,6 +26,10 @@ export function CreateGroup(arg1, arg2) {
+   return window['go']['main']['App']['CreateGroup'](arg1, arg2);
+ }
+ 
++export function DeleteZone(arg1) {
++  return window['go']['main']['App']['DeleteZone'](arg1);
++}
++
+ export function ForceUpdate() {
+   return window['go']['main']['App']['ForceUpdate']();
+ }
+@@ -34,10 +46,18 @@ export function GetFoundBaseStations() {
+   return window['go']['main']['App']['GetFoundBaseStations']();
+ }
+ 
++export function GetRoomStatus() {
++  return window['go']['main']['App']['GetRoomStatus']();
++}
++
+ export function GetVersion() {
+   return window['go']['main']['App']['GetVersion']();
+ }
+ 
++export function GetZoneLog() {
++  return window['go']['main']['App']['GetZoneLog']();
++}
++
+ export function IdentitifyBaseStation(arg1) {
+   return window['go']['main']['App']['IdentitifyBaseStation'](arg1);
+ }
+@@ -58,6 +78,14 @@ export function IsUpdatingSupported() {
+   return window['go']['main']['App']['IsUpdatingSupported']();
+ }
+ 
++export function LaunchRoomSetup() {
++  return window['go']['main']['App']['LaunchRoomSetup']();
++}
++
++export function ListZones() {
++  return window['go']['main']['App']['ListZones']();
++}
++
+ export function Notify(arg1, arg2) {
+   return window['go']['main']['App']['Notify'](arg1, arg2);
+ }
+@@ -70,6 +98,14 @@ export function RenameGroup(arg1, arg2) {
+   return window['go']['main']['App']['RenameGroup'](arg1, arg2);
+ }
+ 
++export function RenameZone(arg1, arg2) {
++  return window['go']['main']['App']['RenameZone'](arg1, arg2);
++}
++
++export function SetAutoZone(arg1) {
++  return window['go']['main']['App']['SetAutoZone'](arg1);
++}
++
+ export function Shutdown() {
+   return window['go']['main']['App']['Shutdown']();
+ }
+diff --git a/frontend/wailsjs/go/models.ts b/frontend/wailsjs/go/models.ts
+index 666a67c..6888147 100755
+--- a/frontend/wailsjs/go/models.ts
++++ b/frontend/wailsjs/go/models.ts
+@@ -99,6 +99,49 @@ export namespace main {
+ 		    return a;
+ 		}
+ 	}
++	
++	export class RoomStatus {
++	    supported: boolean;
++	    steamvr_running: boolean;
++	    helper_found: boolean;
++	    room_setup_found: boolean;
++	    watcher_running: boolean;
++	
++	    static createFrom(source: any = {}) {
++	        return new RoomStatus(source);
++	    }
++	
++	    constructor(source: any = {}) {
++	        if ('string' === typeof source) source = JSON.parse(source);
++	        this.supported = source["supported"];
++	        this.steamvr_running = source["steamvr_running"];
++	        this.helper_found = source["helper_found"];
++	        this.room_setup_found = source["room_setup_found"];
++	        this.watcher_running = source["watcher_running"];
++	    }
++	}
++	export class Zone {
++	    id: string;
++	    name: string;
++	    data?: string;
++	    play_area: number[];
++	    created_at: string;
++	    auto_apply: boolean;
++	
++	    static createFrom(source: any = {}) {
++	        return new Zone(source);
++	    }
++	
++	    constructor(source: any = {}) {
++	        if ('string' === typeof source) source = JSON.parse(source);
++	        this.id = source["id"];
++	        this.name = source["name"];
++	        this.data = source["data"];
++	        this.play_area = source["play_area"];
++	        this.created_at = source["created_at"];
++	        this.auto_apply = source["auto_apply"];
++	    }
++	}
+ 
+ }
+ 
+diff --git a/playarea_linux.go b/playarea_linux.go
+new file mode 100644
+index 0000000..cff3f8a
+--- /dev/null
++++ b/playarea_linux.go
+@@ -0,0 +1,643 @@
++//go:build linux
++// +build linux
++
++package main
++
++// Play area ("Room" page) support: saved SteamVR chaperone zones, their
++// automatic re-application, and the patched Room Setup launcher. Ported from
++// the standalone vr-zones tool - it keeps the same ~/.config/vr-zones/zones.json
++// so profiles saved there carry over. SteamVR is reached through the small
++// vrchap-io helper (tools/vrchap-io, OpenVR ExportLiveToBuffer /
++// ImportFromBufferToWorking) and Room Setup through tools/room-setup-fix.
++
++import (
++	"bytes"
++	"context"
++	"crypto/rand"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"log"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"sync"
++	"syscall"
++	"time"
++)
++
++type Zone struct {
++	Id        string    `json:"id"`
++	Name      string    `json:"name"`
++	Data      string    `json:"data,omitempty"`
++	PlayArea  []float64 `json:"play_area"`
++	CreatedAt string    `json:"created_at"`
++	AutoApply bool      `json:"auto_apply"`
++}
++
++type zoneStore struct {
++	Zones map[string]*Zone `json:"zones"`
++}
++
++type RoomStatus struct {
++	Supported      bool `json:"supported"`
++	SteamVRRunning bool `json:"steamvr_running"`
++	HelperFound    bool `json:"helper_found"`
++	RoomSetupFound bool `json:"room_setup_found"`
++	WatcherRunning bool `json:"watcher_running"`
++}
++
++var (
++	zonesMu    sync.Mutex // guards zones.json read-modify-write
++	zoneLogMu  sync.Mutex
++	zoneLog    []string
++	zoneWatchO sync.Once
++)
++
++func homeDir() string {
++	h, _ := os.UserHomeDir()
++	return h
++}
++
++// findTool looks for a bundled helper: $env first, then next to the
++// executable (packaged layout) and in the source tree (build/bin/<exe> ->
++// ../../tools/...).
++func findTool(env string, rel ...string) string {
++	if p := os.Getenv(env); p != "" {
++		return p
++	}
++	var candidates []string
++	if exe, err := os.Executable(); err == nil {
++		dir := filepath.Dir(exe)
++		candidates = append(candidates,
++			filepath.Join(append([]string{dir, "tools"}, rel...)...),
++			filepath.Join(append([]string{dir, "..", "..", "tools"}, rel...)...))
++	}
++	if wd, err := os.Getwd(); err == nil {
++		candidates = append(candidates, filepath.Join(append([]string{wd, "tools"}, rel...)...))
++	}
++	for _, c := range candidates {
++		if fileExists(c) {
++			return filepath.Clean(c)
++		}
++	}
++	if len(candidates) > 0 {
++		return filepath.Clean(candidates[0])
++	}
++	return filepath.Join(rel...)
++}
++
++func vrchapIOPath() string {
++	return findTool("BSM_VRCHAP_IO", "vrchap-io", "vrchap-io")
++}
++
++func roomSetupPath() string {
++	return findTool("BSM_ROOM_SETUP", "room-setup-fix", "vr-room-setup")
++}
++
++func zonesFile() string {
++	dir := os.Getenv("XDG_CONFIG_HOME")
++	if dir == "" {
++		dir = filepath.Join(homeDir(), ".config")
++	}
++	return filepath.Join(dir, "vr-zones", "zones.json")
++}
++
++func vrserverLogPath() string {
++	return filepath.Join(homeDir(), ".local", "share", "Steam", "logs", "vrserver.txt")
++}
++
++func fileExists(p string) bool {
++	_, err := os.Stat(p)
++	return err == nil
++}
++
++// zoneLogf records a line for the Room page and the app log.
++func zoneLogf(format string, args ...interface{}) {
++	line := fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
++	log.Println("[zones]", line)
++
++	zoneLogMu.Lock()
++	defer zoneLogMu.Unlock()
++	zoneLog = append(zoneLog, line)
++	if len(zoneLog) > 50 {
++		zoneLog = zoneLog[len(zoneLog)-50:]
++	}
++}
++
++// ---------- storage ------------------------------------------------------------------------------
++
++func loadZones() (*zoneStore, error) {
++	store := &zoneStore{Zones: map[string]*Zone{}}
++	raw, err := os.ReadFile(zonesFile())
++	if errors.Is(err, os.ErrNotExist) {
++		return store, nil
++	}
++	if err != nil {
++		return nil, err
++	}
++	if err := json.Unmarshal(raw, store); err != nil {
++		return nil, err
++	}
++	if store.Zones == nil {
++		store.Zones = map[string]*Zone{}
++	}
++	return store, nil
++}
++
++func saveZones(store *zoneStore) error {
++	path := zonesFile()
++	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
++		return err
++	}
++	raw, err := json.MarshalIndent(store, "", "  ")
++	if err != nil {
++		return err
++	}
++	tmp := strings.TrimSuffix(path, ".json") + ".tmp"
++	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
++		return err
++	}
++	return os.Rename(tmp, path)
++}
++
++// ---------- SteamVR ------------------------------------------------------------------------------
++
++func steamVRRunning() bool {
++	return vrserverPid() != ""
++}
++
++func vrserverPid() string {
++	entries, err := os.ReadDir("/proc")
++	if err != nil {
++		return ""
++	}
++	for _, e := range entries {
++		if _, err := strconv.Atoi(e.Name()); err != nil {
++			continue
++		}
++		comm, err := os.ReadFile(filepath.Join("/proc", e.Name(), "comm"))
++		if err == nil && strings.TrimSpace(string(comm)) == "vrserver" {
++			return e.Name()
++		}
++	}
++	return ""
++}
++
++// runHelper runs vrchap-io. VR_Init can hang while SteamVR is still starting,
++// hence the timeout; exit code 124 means "SteamVR didn't answer in time".
++func runHelper(timeout time.Duration, stdin string, args ...string) (int, string, string) {
++	helper := vrchapIOPath()
++	if !fileExists(helper) {
++		return -1, "", fmt.Sprintf("нема %s: запустіть tools/vrchap-io/build.sh", helper)
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), timeout)
++	defer cancel()
++
++	cmd := exec.CommandContext(ctx, helper, args...)
++	var stdout, stderr bytes.Buffer
++	cmd.Stdout, cmd.Stderr = &stdout, &stderr
++	if stdin != "" {
++		cmd.Stdin = strings.NewReader(stdin)
++	}
++	err := cmd.Run()
++	if ctx.Err() == context.DeadlineExceeded {
++		return 124, "", "SteamVR не відповів вчасно"
++	}
++	code := 0
++	if err != nil {
++		var exitErr *exec.ExitError
++		if errors.As(err, &exitErr) {
++			code = exitErr.ExitCode()
++		} else {
++			return -1, "", err.Error()
++		}
++	}
++	return code, strings.TrimSpace(stdout.String()), strings.TrimSpace(stderr.String())
++}
++
++func exportLive() (string, error) {
++	code, out, errOut := runHelper(25*time.Second, "", "export")
++	if code != 0 {
++		if errOut == "" {
++			errOut = "не вдалося отримати поточну зону"
++		}
++		return "", errors.New(errOut)
++	}
++	return out, nil
++}
++
++type universeInfo struct {
++	id       string
++	playArea []float64
++}
++
++// universes returns (id, play_area) for every universe in a chaperone JSON,
++// with or without the "universes" wrapper.
++func universes(blob string) []universeInfo {
++	// UseNumber keeps big universe IDs exact instead of rounding them to float64.
++	var root interface{}
++	dec := json.NewDecoder(strings.NewReader(blob))
++	dec.UseNumber()
++	if err := dec.Decode(&root); err != nil {
++		return nil
++	}
++	var items []interface{}
++	if obj, ok := root.(map[string]interface{}); ok {
++		if list, ok := obj["universes"].([]interface{}); ok {
++			items = list
++		} else {
++			items = []interface{}{obj}
++		}
++	}
++	var result []universeInfo
++	for _, item := range items {
++		u, ok := item.(map[string]interface{})
++		if !ok {
++			continue
++		}
++		info := universeInfo{id: "?"}
++		if id, ok := u["universeID"]; ok {
++			info.id = fmt.Sprint(id)
++		}
++		if pa, ok := u["play_area"].([]interface{}); ok {
++			for _, v := range pa {
++				if n, ok := v.(json.Number); ok {
++					if f, err := n.Float64(); err == nil {
++						info.playArea = append(info.playArea, f)
++					}
++				}
++			}
++		}
++		result = append(result, info)
++	}
++	return result
++}
++
++func formatArea(pa []float64) string {
++	if len(pa) < 2 {
++		return "розмір невідомий"
++	}
++	return fmt.Sprintf("%.1f × %.1f м", pa[0], pa[1])
++}
++
++func applyBlob(blob string) error {
++	code, out, errOut := runHelper(25*time.Second, blob, "import", "-")
++	if code == 0 && strings.Contains(out, "applied") {
++		return nil
++	}
++	msg := errOut
++	if msg == "" {
++		msg = out
++	}
++	if msg == "" {
++		msg = "SteamVR не прийняв зону"
++	}
++	return errors.New(msg)
++}
++
++func applyZoneById(id string) (string, error) {
++	zonesMu.Lock()
++	store, err := loadZones()
++	zonesMu.Unlock()
++	if err != nil {
++		return "", err
++	}
++	zone := store.Zones[id]
++	if zone == nil {
++		return "", errors.New("зону видалено")
++	}
++
++	warn := ""
++	if live, err := exportLive(); err == nil {
++		saved := map[string]bool{}
++		for _, u := range universes(zone.Data) {
++			saved[u.id] = true
++		}
++		var liveIds []string
++		overlap := false
++		for _, u := range universes(live) {
++			liveIds = append(liveIds, u.id)
++			overlap = overlap || saved[u.id]
++		}
++		if len(saved) > 0 && len(liveIds) > 0 && !overlap {
++			warn = fmt.Sprintf("увага: зона збережена для іншого всесвіту станцій (зараз %s); ", strings.Join(liveIds, ", "))
++		}
++	}
++
++	if err := applyBlob(zone.Data); err != nil {
++		return "", err
++	}
++	return fmt.Sprintf("%sзастосовано «%s» (%s)", warn, zone.Name, formatArea(zone.PlayArea)), nil
++}
++
++func autoZoneId() string {
++	zonesMu.Lock()
++	defer zonesMu.Unlock()
++	store, err := loadZones()
++	if err != nil {
++		return ""
++	}
++	for id, z := range store.Zones {
++		if z.AutoApply {
++			return id
++		}
++	}
++	return ""
++}
++
++func newZoneId() string {
++	b := make([]byte, 4)
++	_, _ = rand.Read(b)
++	return hex.EncodeToString(b)
++}
++
++// ---------- watcher ------------------------------------------------------------------------------
++
++// startZoneWatcher re-applies the auto zone (1) once per SteamVR session, as
++// soon as the room is reachable, and (2) after every base station tilt
++// recalibration ("CALIBRATED base" in vrserver.txt), which is when the floor
++// and bounds drift. It runs for the life of the app - SteamVR launches us for
++// every session and we quit when it stops.
++func startZoneWatcher() {
++	zoneWatchO.Do(func() { go zoneWatcher() })
++}
++
++func zoneWatcher() {
++	zoneLogf("стежу за SteamVR")
++	lastPid := ""
++	var logPos int64 = -1
++	var pendingAt time.Time
++
++	for {
++		pid := vrserverPid()
++		switch {
++		case pid != "" && pid != lastPid:
++			lastPid = pid
++			zoneLogf("SteamVR запущений (vrserver %s)", pid)
++			sessionApply(pid)
++			logPos = logSize()
++		case pid == "" && lastPid != "":
++			zoneLogf("SteamVR закрився")
++			lastPid, logPos, pendingAt = "", -1, time.Time{}
++		case pid != "" && logPos >= 0:
++			var hit bool
++			logPos, hit = scanRecalibrations(logPos)
++			if hit {
++				// Several stations recalibrate in a row; wait for 3 s of quiet.
++				pendingAt = time.Now().Add(3 * time.Second)
++			}
++		}
++
++		if !pendingAt.IsZero() && time.Now().After(pendingAt) {
++			pendingAt = time.Time{}
++			if id := autoZoneId(); id != "" {
++				zoneLogf("станція наново відкалібрувала нахил — перезастосовую зону")
++				if msg, err := applyZoneById(id); err != nil {
++					zoneLogf("не вдалося застосувати після перекалібрування: %v", err)
++				} else {
++					zoneLogf("%s", msg)
++				}
++			}
++		}
++		time.Sleep(2 * time.Second)
++	}
++}
++
++func logSize() int64 {
++	info, err := os.Stat(vrserverLogPath())
++	if err != nil {
++		return 0
++	}
++	return info.Size()
++}
++
++func scanRecalibrations(from int64) (int64, bool) {
++	f, err := os.Open(vrserverLogPath())
++	if err != nil {
++		return from, false
++	}
++	defer f.Close()
++	if info, err := f.Stat(); err == nil && info.Size() < from {
++		from = 0 // log was rotated by a new session
++	}
++	if _, err := f.Seek(from, io.SeekStart); err != nil {
++		return from, false
++	}
++	chunk, err := io.ReadAll(f)
++	if err != nil {
++		return from, false
++	}
++	return from + int64(len(chunk)), bytes.Contains(chunk, []byte("CALIBRATED base"))
++}
++
++func sessionApply(pid string) {
++	id := autoZoneId()
++	if id == "" {
++		zoneLogf("немає зони з автозастосуванням")
++		return
++	}
++
++	deadline := time.Now().Add(4 * time.Minute)
++	ready := false
++	for time.Now().Before(deadline) {
++		if vrserverPid() != pid {
++			return
++		}
++		if code, _, _ := runHelper(12*time.Second, "", "check"); code == 0 {
++			ready = true
++			break
++		}
++		time.Sleep(3 * time.Second)
++	}
++	if !ready {
++		zoneLogf("SteamVR так і не став готовий за 4 хвилини")
++		return
++	}
++
++	time.Sleep(6 * time.Second) // let the stations settle the universe first
++	for attempt := 1; attempt <= 6; attempt++ {
++		if vrserverPid() != pid {
++			return
++		}
++		msg, err := applyZoneById(id)
++		if err == nil {
++			zoneLogf("%s (спроба %d)", msg, attempt)
++			return
++		}
++		zoneLogf("спроба %d не вдалась: %v", attempt, err)
++		time.Sleep(5 * time.Second)
++	}
++	zoneLogf("не вдалося застосувати зону при старті")
++}
++
++// ---------- bindings -----------------------------------------------------------------------------
++
++func (a *App) GetRoomStatus() RoomStatus {
++	return RoomStatus{
++		Supported:      true,
++		SteamVRRunning: steamVRRunning(),
++		HelperFound:    fileExists(vrchapIOPath()),
++		RoomSetupFound: fileExists(roomSetupPath()),
++		WatcherRunning: true,
++	}
++}
++
++func (a *App) ListZones() []Zone {
++	zonesMu.Lock()
++	defer zonesMu.Unlock()
++	store, err := loadZones()
++	if err != nil {
++		zoneLogf("не вдалося прочитати зони: %v", err)
++		return []Zone{}
++	}
++	result := make([]Zone, 0, len(store.Zones))
++	for id, z := range store.Zones {
++		zone := *z
++		zone.Id = id
++		zone.Data = ""
++		result = append(result, zone)
++	}
++	return result
++}
++
++func (a *App) GetZoneLog() []string {
++	zoneLogMu.Lock()
++	defer zoneLogMu.Unlock()
++	return append([]string{}, zoneLog...)
++}
++
++func (a *App) CaptureZone(name string) string {
++	name = strings.TrimSpace(name)
++	if name == "" {
++		return "error: вкажіть назву"
++	}
++	blob, err := exportLive()
++	if err != nil {
++		return "error: " + err.Error()
++	}
++	us := universes(blob)
++	if len(us) == 0 {
++		return "error: SteamVR віддав порожні дані кімнати — спершу пройдіть калібрування кімнати"
++	}
++
++	zonesMu.Lock()
++	defer zonesMu.Unlock()
++	store, err := loadZones()
++	if err != nil {
++		return "error: " + err.Error()
++	}
++	for _, z := range store.Zones {
++		if strings.EqualFold(z.Name, name) {
++			return fmt.Sprintf("error: зона «%s» уже є", name)
++		}
++	}
++	id := newZoneId()
++	store.Zones[id] = &Zone{
++		Id: id, Name: name, Data: blob, PlayArea: us[0].playArea,
++		CreatedAt: time.Now().Format("2006-01-02T15:04:05"),
++	}
++	if err := saveZones(store); err != nil {
++		return "error: " + err.Error()
++	}
++	zoneLogf("збережено «%s» (%s)", name, formatArea(us[0].playArea))
++	return "ok"
++}
++
++func (a *App) ApplyZone(id string) string {
++	msg, err := applyZoneById(id)
++	if err != nil {
++		zoneLogf("не вдалося застосувати: %v", err)
++		return "error: " + err.Error()
++	}
++	zoneLogf("%s", msg)
++	return "ok"
++}
++
++func (a *App) RenameZone(id string, name string) string {
++	name = strings.TrimSpace(name)
++	if name == "" {
++		return "error: вкажіть назву"
++	}
++	zonesMu.Lock()
++	defer zonesMu.Unlock()
++	store, err := loadZones()
++	if err != nil {
++		return "error: " + err.Error()
++	}
++	zone := store.Zones[id]
++	if zone == nil {
++		return "error: зону видалено"
++	}
++	for otherId, z := range store.Zones {
++		if otherId != id && strings.EqualFold(z.Name, name) {
++			return fmt.Sprintf("error: зона «%s» уже є", name)
++		}
++	}
++	zone.Name = name
++	if err := saveZones(store); err != nil {
++		return "error: " + err.Error()
++	}
++	return "ok"
++}
++
++func (a *App) DeleteZone(id string) string {
++	zonesMu.Lock()
++	defer zonesMu.Unlock()
++	store, err := loadZones()
++	if err != nil {
++		return "error: " + err.Error()
++	}
++	zone := store.Zones[id]
++	if zone == nil {
++		return "ok"
++	}
++	delete(store.Zones, id)
++	if err := saveZones(store); err != nil {
++		return "error: " + err.Error()
++	}
++	zoneLogf("видалено «%s»", zone.Name)
++	return "ok"
++}
++
++// SetAutoZone makes id the only auto-applied zone; an empty id turns it off.
++func (a *App) SetAutoZone(id string) string {
++	zonesMu.Lock()
++	defer zonesMu.Unlock()
++	store, err := loadZones()
++	if err != nil {
++		return "error: " + err.Error()
++	}
++	if id != "" && store.Zones[id] == nil {
++		return "error: зону видалено"
++	}
++	for zid, z := range store.Zones {
++		z.AutoApply = zid == id
++	}
++	if err := saveZones(store); err != nil {
++		return "error: " + err.Error()
++	}
++	return "ok"
++}
++
++func (a *App) LaunchRoomSetup() string {
++	if !steamVRRunning() {
++		return "error: спершу запустіть SteamVR"
++	}
++	path := roomSetupPath()
++	if !fileExists(path) {
++		return "error: нема " + path
++	}
++	cmd := exec.Command(path)
++	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
++	if err := cmd.Start(); err != nil {
++		return "error: " + err.Error()
++	}
++	go cmd.Wait()
++	zoneLogf("запущено калібрування кімнати (Room Setup)")
++	return "ok"
++}
+diff --git a/playarea_other.go b/playarea_other.go
+new file mode 100644
+index 0000000..c4adf90
+--- /dev/null
++++ b/playarea_other.go
+@@ -0,0 +1,37 @@
++//go:build !linux
++// +build !linux
++
++package main
++
++// Play area management relies on the Linux vrchap-io helper and the patched
++// Room Setup launcher; other platforms get inert stubs.
++
++type Zone struct {
++	Id        string    `json:"id"`
++	Name      string    `json:"name"`
++	PlayArea  []float64 `json:"play_area"`
++	CreatedAt string    `json:"created_at"`
++	AutoApply bool      `json:"auto_apply"`
++}
++
++type RoomStatus struct {
++	Supported      bool `json:"supported"`
++	SteamVRRunning bool `json:"steamvr_running"`
++	HelperFound    bool `json:"helper_found"`
++	RoomSetupFound bool `json:"room_setup_found"`
++	WatcherRunning bool `json:"watcher_running"`
++}
++
++const playAreaUnsupported = "error: not supported on this platform"
++
++func startZoneWatcher() {}
++
++func (a *App) GetRoomStatus() RoomStatus                { return RoomStatus{} }
++func (a *App) ListZones() []Zone                        { return []Zone{} }
++func (a *App) GetZoneLog() []string                     { return []string{} }
++func (a *App) CaptureZone(name string) string           { return playAreaUnsupported }
++func (a *App) ApplyZone(id string) string               { return playAreaUnsupported }
++func (a *App) RenameZone(id string, name string) string { return playAreaUnsupported }
++func (a *App) DeleteZone(id string) string              { return playAreaUnsupported }
++func (a *App) SetAutoZone(id string) string             { return playAreaUnsupported }
++func (a *App) LaunchRoomSetup() string                  { return playAreaUnsupported }
+-- 
+2.55.0
+
+
+From d293eba33cc6d082b93dbd3ff23f8f940365fcc0 Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Sat, 26 Sep 2026 23:44:28 +0200
+Subject: [PATCH 4/4] fix(play-area): give SteamVR up to 2 min to settle the
+ universe before applying
+
+In a live session (2026-09-26 22:01) the auto zone only went in on attempt
+5 of 6: until the base stations have settled which universe this is,
+ImportFromBufferToWorking fails ("wrong universe?"), and that took ~25 s.
+Slightly slower tracking would have exhausted the attempts and left the
+zone unapplied until the next base station recalibration.
+
+- keep retrying every 5 s for up to 2 minutes, logging at most every 30 s
+- log where vrchap-io and the Room Setup launcher were found (or not) when
+  the watcher starts, so a missing helper is obvious from the Room page
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ playarea_linux.go | 31 +++++++++++++++++++++++++++----
+ 1 file changed, 27 insertions(+), 4 deletions(-)
+
+diff --git a/playarea_linux.go b/playarea_linux.go
+index cff3f8a..11e418d 100644
+--- a/playarea_linux.go
++++ b/playarea_linux.go
+@@ -369,6 +369,16 @@ func startZoneWatcher() {
+ 
+ func zoneWatcher() {
+ 	zoneLogf("стежу за SteamVR")
++	for _, tool := range []struct{ name, path string }{
++		{"vrchap-io", vrchapIOPath()},
++		{"Room Setup", roomSetupPath()},
++	} {
++		state := "знайдено"
++		if !fileExists(tool.path) {
++			state = "НЕМАЄ"
++		}
++		zoneLogf("%s: %s (%s)", tool.name, tool.path, state)
++	}
+ 	lastPid := ""
+ 	var logPos int64 = -1
+ 	var pendingAt time.Time
+@@ -459,8 +469,15 @@ func sessionApply(pid string) {
+ 		return
+ 	}
+ 
+-	time.Sleep(6 * time.Second) // let the stations settle the universe first
+-	for attempt := 1; attempt <= 6; attempt++ {
++	// Right after startup SteamVR keeps rejecting the import ("wrong
++	// universe?") until the base stations have settled which universe this
++	// is - about 25 s in a real session, which used up five of the six
++	// attempts this loop used to allow. Keep trying for up to 2 minutes and
++	// log a failure at most every 30 s so the Room page log stays readable.
++	time.Sleep(6 * time.Second)
++	deadline = time.Now().Add(2 * time.Minute)
++	var lastLogged time.Time
++	for attempt := 1; ; attempt++ {
+ 		if vrserverPid() != pid {
+ 			return
+ 		}
+@@ -469,10 +486,16 @@ func sessionApply(pid string) {
+ 			zoneLogf("%s (спроба %d)", msg, attempt)
+ 			return
+ 		}
+-		zoneLogf("спроба %d не вдалась: %v", attempt, err)
++		if time.Since(lastLogged) >= 30*time.Second {
++			zoneLogf("спроба %d не вдалась, SteamVR ще не готовий? %v", attempt, err)
++			lastLogged = time.Now()
++		}
++		if time.Now().After(deadline) {
++			break
++		}
+ 		time.Sleep(5 * time.Second)
+ 	}
+-	zoneLogf("не вдалося застосувати зону при старті")
++	zoneLogf("не вдалося застосувати зону за 2 хвилини; спробую знову після перекалібрування станцій")
+ }
+ 
+ // ---------- bindings -----------------------------------------------------------------------------
+-- 
+2.55.0
+
