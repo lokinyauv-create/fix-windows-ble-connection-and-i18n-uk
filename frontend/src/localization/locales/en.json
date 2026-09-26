@@ -47,7 +47,26 @@
     "Manage Power (Power on)": "Manage Power (Power on)",
     "Wake up base stations on SteamVR Launch": "Wake up base stations on SteamVR Launch",
     "Manage Power (Power Off)": "Manage Power (Power off)",
-    "Power off base stations on SteamVR Exit": "Power off base stations on SteamVR exit"
-    
-
+    "Power off base stations on SteamVR Exit": "Power off base stations on SteamVR exit",
+    "Room": "Room",
+    "Room Setup": "Room Setup",
+    "Room Setup launcher not found": "Room Setup launcher not found",
+    "Calibrate the floor and draw the play area (fixed for Linux/AMD)": "Calibrate the floor and draw the play area (fixed for Linux/AMD)",
+    "Start SteamVR first": "Start SteamVR first",
+    "Room Setup started": "Room Setup started",
+    "Launch": "Launch",
+    "Save current play area": "Save current play area",
+    "Takes the zone SteamVR is using right now": "Takes the zone SteamVR is using right now",
+    "Zone name": "Zone name",
+    "Zone saved": "Zone saved",
+    "Save": "Save",
+    "No saved zones yet": "No saved zones yet",
+    "Apply automatically when SteamVR starts and after base station recalibration": "Apply automatically when SteamVR starts and after base station recalibration",
+    "Auto": "Auto",
+    "Apply now": "Apply now",
+    "Zone applied": "Zone applied",
+    "Rename": "Rename",
+    "Delete": "Delete",
+    "Click again to delete": "Click again to delete",
+    "Waiting for SteamVR...": "Waiting for SteamVR..."
 }

@@ -67,6 +67,9 @@ func (a *App) startup(ctx context.Context) {
 
 	a.ctx = ctx
 
+	// Keeps the saved play area applied for the whole SteamVR session.
+	startZoneWatcher()
+
 	go func() {
 		for {
 			<-WAKE_UP_CHANNEL

@@ -72,3 +72,54 @@ export const UpdateBaseStationParam = async (id: string, param: string, value: a
 export const RemoveGroup = async (id: string): Promise<void> => {
     return native.RemoveGroup(id);
 }
+export interface PlayAreaZone {
+    id: string,
+    name: string,
+    play_area: number[] | null,
+    created_at: string,
+    auto_apply: boolean
+}
+
+export interface RoomStatus {
+    supported: boolean,
+    steamvr_running: boolean,
+    helper_found: boolean,
+    room_setup_found: boolean,
+    watcher_running: boolean
+}
+
+export const GetRoomStatus = async (): Promise<RoomStatus> => {
+    return native.GetRoomStatus() as Promise<RoomStatus>;
+}
+
+export const ListZones = async (): Promise<PlayAreaZone[]> => {
+    return (await native.ListZones() ?? []) as PlayAreaZone[];
+}
+
+export const GetZoneLog = async (): Promise<string[]> => {
+    return (await native.GetZoneLog()) ?? [];
+}
+
+export const CaptureZone = async (name: string): Promise<status> => {
+    return native.CaptureZone(name);
+}
+
+export const ApplyZone = async (id: string): Promise<status> => {
+    return native.ApplyZone(id);
+}
+
+export const RenameZone = async (id: string, name: string): Promise<status> => {
+    return native.RenameZone(id, name);
+}
+
+export const DeleteZone = async (id: string): Promise<status> => {
+    return native.DeleteZone(id);
+}
+
+export const SetAutoZone = async (id: string): Promise<status> => {
+    return native.SetAutoZone(id);
+}
+
+export const LaunchRoomSetup = async (): Promise<status> => {
+    return native.LaunchRoomSetup();
+}
