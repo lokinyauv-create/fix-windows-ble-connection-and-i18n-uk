@@ -1,4 +1,4 @@
-import { Power, PowerOff, SettingsIcon, X, XIcon } from "lucide-preact";
+import { Map as MapIcon, Power, PowerOff, SettingsIcon, X, XIcon } from "lucide-preact";
 import { ChangeBaseStationPowerStatus, IsSteamVRConnected, Shutdown, UpdateConfigValue } from "@src/lib/native/index";
 import { useContext, useEffect, useState } from "preact/hooks";
 import { AnimatePresence, motion } from 'framer-motion';
@@ -157,6 +157,9 @@ export function TitleBar() {
             </button>
             <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25" onClick={() => setAllPower("sleep")} disabled={powerBusy} title={t("Turn off")}>
                 <PowerOff color="#C6C6C6"/>
+            </button>
+            <button className="opacity-75 hover:opacity-100 duration-150" onClick={() => route("/room", true)} title={t("Room")}>
+                <MapIcon color="#888888" />
             </button>
             <button onClick={(c) => route("/settings", true)}>
                 {/* <TitleBarSettingsIcon width={16} height={16} fill="#888888" className={`hover:fill-[#1D81FF] duration-200`} /> */}

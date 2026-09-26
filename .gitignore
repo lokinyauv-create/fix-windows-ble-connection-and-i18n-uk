@@ -3,3 +3,6 @@ node_modules
 frontend/dist
 build/windows/installer
 log.txt
+tools/vrchap-io/vrchap-io
+tools/vrchap-io/third_party
+tools/room-setup-fix/*.so

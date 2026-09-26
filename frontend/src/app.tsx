@@ -14,6 +14,7 @@ import { GroupedBaseStationSettings } from './views/groups/GroupedBaseStationSet
 import { useEffect, useRef } from 'preact/hooks';
 import { WebsocketProvider } from '@src/lib/context/websocket.context.tsx';
 import { SoftwareUpdatesView } from './views/settings/UpdatesView';
+import { PlayAreaView } from './views/PlayAreaView';
 
 const AnimatedPath = ({ children, path }) => {
     return (<motion.div key={path} initial={{ opacity: 0, x: -5 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 5 }}>
@@ -39,6 +40,9 @@ export function App(props) {
                         </AnimatedPath>
                            <AnimatedPath path={"/settings/updates"}>
                             <SoftwareUpdatesView />
+                        </AnimatedPath>
+                        <AnimatedPath path={"/room"}>
+                            <PlayAreaView />
                         </AnimatedPath>
                         <AnimatedPath path={"/devices/:id"}>
                             <BaseStationSettingsPage />
