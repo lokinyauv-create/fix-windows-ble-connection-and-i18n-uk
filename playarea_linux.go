@@ -369,6 +369,16 @@ func startZoneWatcher() {
 
 func zoneWatcher() {
 	zoneLogf("стежу за SteamVR")
+	for _, tool := range []struct{ name, path string }{
+		{"vrchap-io", vrchapIOPath()},
+		{"Room Setup", roomSetupPath()},
+	} {
+		state := "знайдено"
+		if !fileExists(tool.path) {
+			state = "НЕМАЄ"
+		}
+		zoneLogf("%s: %s (%s)", tool.name, tool.path, state)
+	}
 	lastPid := ""
 	var logPos int64 = -1
 	var pendingAt time.Time
@@ -459,8 +469,15 @@ func sessionApply(pid string) {
 		return
 	}
 
-	time.Sleep(6 * time.Second) // let the stations settle the universe first
-	for attempt := 1; attempt <= 6; attempt++ {
+	// Right after startup SteamVR keeps rejecting the import ("wrong
+	// universe?") until the base stations have settled which universe this
+	// is - about 25 s in a real session, which used up five of the six
+	// attempts this loop used to allow. Keep trying for up to 2 minutes and
+	// log a failure at most every 30 s so the Room page log stays readable.
+	time.Sleep(6 * time.Second)
+	deadline = time.Now().Add(2 * time.Minute)
+	var lastLogged time.Time
+	for attempt := 1; ; attempt++ {
 		if vrserverPid() != pid {
 			return
 		}
@@ -469,10 +486,16 @@ func sessionApply(pid string) {
 			zoneLogf("%s (спроба %d)", msg, attempt)
 			return
 		}
-		zoneLogf("спроба %d не вдалась: %v", attempt, err)
+		if time.Since(lastLogged) >= 30*time.Second {
+			zoneLogf("спроба %d не вдалась, SteamVR ще не готовий? %v", attempt, err)
+			lastLogged = time.Now()
+		}
+		if time.Now().After(deadline) {
+			break
+		}
 		time.Sleep(5 * time.Second)
 	}
-	zoneLogf("не вдалося застосувати зону при старті")
+	zoneLogf("не вдалося застосувати зону за 2 хвилини; спробую знову після перекалібрування станцій")
 }
 
 // ---------- bindings -----------------------------------------------------------------------------
