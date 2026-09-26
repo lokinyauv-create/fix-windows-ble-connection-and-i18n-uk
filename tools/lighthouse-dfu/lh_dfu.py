@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+"""Firmware update for Valve Lighthouse 2.0 base stations from Linux.
+
+SteamVR only updates base stations over Bluetooth on Windows - the Linux
+lighthouse driver has no BlueZ code at all. The stations are plain Nordic
+Secure DFU targets though (buttonless DFU service 0xFE59), and SteamVR ships
+the signed Valve package, so this drives the standard Nordic DFU protocol
+through BlueZ over D-Bus.
+
+  lh_dfu.py info  AA:BB:CC:DD:EE:FF [...]     read firmware versions only
+  lh_dfu.py flash AA:BB:CC:DD:EE:FF [--package ZIP]   (disabled, see below)
+  lh_dfu.py dfu [--package ZIP]      flash a station already in its bootloader
+
+To put a station into its bootloader by hand: unplug its power, hold the
+button on the back and plug the power back in (the LED stays off). It then
+advertises as "LHB-DFU" and takes a plain Nordic Secure DFU - no Valve
+authentication involved (same thing people do with nRF Connect on a phone).
+Only have one station in that mode at a time. Replug power afterwards.
+
+The bootloader verifies the package signature, and an interrupted update
+leaves the station in its bootloader (advertising as DfuTarg), where running
+flash again finishes the job.
+
+NOTE (2026-09-26): flash does NOT work on Valve stations. The enter-bootloader
+write hangs and the station just drops the link: SteamVR's libnrfserlib does
+Valve-specific authentication + encryption ("LHB-Unlock") before the
+bootloader command, and its bootloader advertises as "LHB-DFU". SteamVR's own
+updater on Linux (through the Index headset radio) crashes vrmonitor with
+"free(): invalid pointer" (ValveSoftware/SteamVR-for-Linux#653, #709).
+What works: put the station into its bootloader by hand (see above) and run
+`dfu` - verified 2026-09-26 on two stations, radio 2.2 -> 2.9.2004771.
+"""
+
+import argparse
+import asyncio
+import json
+import os
+import struct
+import sys
+import zipfile
+import zlib
+
+from dbus_next import BusType, Message, MessageType, Variant
+from dbus_next.aio import MessageBus
+
+BLUEZ = "org.bluez"
+ADAPTER = "/org/bluez/hci0"
+DEFAULT_PACKAGE = os.path.expanduser(
+    "~/.local/share/Steam/steamapps/common/SteamVR/tools/lighthouse/firmware/"
+    "lighthouse_tx_vader/archive/428/lighthouse_tx_vader_radio_full_dfu.v2_9_2004771.zip")
+
+UUID_FW_REVISION = "00002a26-0000-1000-8000-00805f9b34fb"
+UUID_BUTTONLESS = "8ec90003-f315-4f60-9fb8-838830daea50"
+UUID_CONTROL = "8ec90001-f315-4f60-9fb8-838830daea50"
+UUID_PACKET = "8ec90002-f315-4f60-9fb8-838830daea50"
+
+OP_CREATE, OP_PRN, OP_CRC, OP_EXECUTE, OP_SELECT, OP_RESPONSE = 0x01, 0x02, 0x03, 0x04, 0x06, 0x60
+OBJ_COMMAND, OBJ_DATA = 0x01, 0x02
+RESULTS = {
+    0x00: "invalid opcode", 0x01: "success", 0x02: "opcode not supported",
+    0x03: "invalid parameter", 0x04: "insufficient resources", 0x05: "invalid object",
+    0x07: "unsupported type", 0x08: "operation not permitted", 0x0A: "operation failed",
+    0x0B: "extended error",
+}
+EXT_ERRORS = {
+    0x02: "unknown command", 0x03: "init command invalid", 0x04: "firmware version too low",
+    0x05: "hardware version mismatch", 0x06: "softdevice version mismatch",
+    0x07: "signature missing", 0x08: "wrong hash type", 0x09: "hash failed",
+    0x0A: "wrong signature type", 0x0B: "verification failed", 0x0C: "insufficient space",
+}
+
+
+def log(*args):
+    print(*args, flush=True)
+
+
+def dev_path(mac):
+    return f"{ADAPTER}/dev_{mac.upper().replace(':', '_')}"
+
+
+def mac_plus_one(mac):
+    value = (int(mac.replace(":", ""), 16) + 1) & 0xFFFFFFFFFFFF
+    raw = f"{value:012X}"
+    return ":".join(raw[i:i + 2] for i in range(0, 12, 2))
+
+
+class DfuError(Exception):
+    pass
+
+
+class Bluez:
+    def __init__(self, bus):
+        self.bus = bus
+        self.notify_queues = {}
+        bus.add_message_handler(self._on_message)
+
+    @classmethod
+    async def connect(cls):
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        await bus.call(Message(
+            destination="org.freedesktop.DBus", path="/org/freedesktop/DBus",
+            interface="org.freedesktop.DBus", member="AddMatch", signature="s",
+            body=["type='signal',sender='org.bluez',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'"]))
+        return cls(bus)
+
+    def _on_message(self, msg):
+        if msg.message_type != MessageType.SIGNAL or msg.member != "PropertiesChanged":
+            return
+        if msg.body[0] != "org.bluez.GattCharacteristic1":
+            return
+        queue = self.notify_queues.get(msg.path)
+        if queue is not None and "Value" in msg.body[1]:
+            queue.put_nowait(bytes(msg.body[1]["Value"].value))
+
+    async def call(self, path, interface, member, signature="", body=None, timeout=30):
+        # dbus_next has no call timeout of its own, and BlueZ can sit on a
+        # request forever when the peer resets mid-operation (which is exactly
+        # what entering the bootloader does).
+        try:
+            reply = await asyncio.wait_for(self.bus.call(Message(
+                destination=BLUEZ, path=path, interface=interface, member=member,
+                signature=signature, body=body or [])), timeout)
+        except asyncio.TimeoutError:
+            raise DfuError(f"{interface}.{member} on {path}: timed out after {timeout}s")
+        if reply.message_type == MessageType.ERROR:
+            raise DfuError(f"{interface}.{member} on {path}: {reply.error_name} {reply.body}")
+        return reply.body
+
+    async def get(self, path, interface, prop):
+        body = await self.call(path, "org.freedesktop.DBus.Properties", "Get", "ss", [interface, prop])
+        return body[0].value
+
+    async def objects(self):
+        body = await self.call("/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects")
+        return body[0]
+
+    async def device_exists(self, path):
+        return path in await self.objects()
+
+    async def discover(self, match, timeout):
+        """Scan until match(path, props) accepts a device; returns its path."""
+        try:
+            await self.call(ADAPTER, "org.bluez.Adapter1", "SetDiscoveryFilter", "a{sv}",
+                            [{"Transport": Variant("s", "le"), "DuplicateData": Variant("b", True)}])
+        except DfuError:
+            pass
+        try:
+            await self.call(ADAPTER, "org.bluez.Adapter1", "StartDiscovery")
+        except DfuError as e:
+            if "InProgress" not in str(e):
+                raise
+        try:
+            loop = asyncio.get_running_loop()
+            end = loop.time() + timeout
+            while loop.time() < end:
+                for path, ifaces in (await self.objects()).items():
+                    props = ifaces.get("org.bluez.Device1")
+                    if props and path.startswith(ADAPTER + "/dev_") and match(path, props):
+                        return path
+                await asyncio.sleep(0.5)
+            return None
+        finally:
+            try:
+                await self.call(ADAPTER, "org.bluez.Adapter1", "StopDiscovery")
+            except DfuError:
+                pass
+
+    async def connect_device(self, path, attempts=4):
+        for attempt in range(1, attempts + 1):
+            try:
+                await self.call(path, "org.bluez.Device1", "Connect")
+                for _ in range(60):
+                    if await self.get(path, "org.bluez.Device1", "ServicesResolved"):
+                        return
+                    await asyncio.sleep(0.25)
+                raise DfuError("services were not resolved")
+            except DfuError as e:
+                log(f"  connect attempt {attempt} failed: {e}")
+                await asyncio.sleep(2)
+        raise DfuError(f"could not connect to {path}")
+
+    async def disconnect_device(self, path):
+        try:
+            await self.call(path, "org.bluez.Device1", "Disconnect", timeout=10)
+        except DfuError:
+            pass
+
+    async def find_char(self, device, uuid):
+        for path, ifaces in (await self.objects()).items():
+            props = ifaces.get("org.bluez.GattCharacteristic1")
+            if props and path.startswith(device + "/") and props["UUID"].value.lower() == uuid:
+                return path
+        return None
+
+    async def read(self, char):
+        body = await self.call(char, "org.bluez.GattCharacteristic1", "ReadValue", "a{sv}", [{}])
+        return bytes(body[0])
+
+    async def write(self, char, data, command=False):
+        opts = {"type": Variant("s", "command" if command else "request")}
+        await self.call(char, "org.bluez.GattCharacteristic1", "WriteValue", "aya{sv}", [bytes(data), opts])
+
+    async def start_notify(self, char):
+        self.notify_queues[char] = asyncio.Queue()
+        await self.call(char, "org.bluez.GattCharacteristic1", "StartNotify")
+        return self.notify_queues[char]
+
+
+async def read_version(bz, path):
+    char = await bz.find_char(path, UUID_FW_REVISION)
+    if not char:
+        return "(no firmware revision characteristic)"
+    return (await bz.read(char)).decode(errors="replace").replace("\n", " | ").strip()
+
+
+async def ensure_connected(bz, mac):
+    path = dev_path(mac)
+    if not await bz.device_exists(path):
+        log(f"  scanning for {mac}...")
+        found = await bz.discover(lambda p, props: p == path, 20)
+        if not found:
+            raise DfuError(f"{mac} not found - is the station powered?")
+    await bz.connect_device(path)
+    return path
+
+
+async def cmd_info(bz, macs):
+    for mac in macs:
+        log(f"== {mac}")
+        path = await ensure_connected(bz, mac)
+        log("  firmware:", await read_version(bz, path))
+        log("  buttonless DFU:", "yes" if await bz.find_char(path, UUID_BUTTONLESS) else "no")
+
+
+class DfuSession:
+    def __init__(self, bz, device):
+        self.bz = bz
+        self.device = device
+
+    async def open(self):
+        self.control = await self.bz.find_char(self.device, UUID_CONTROL)
+        self.packet = await self.bz.find_char(self.device, UUID_PACKET)
+        if not self.control or not self.packet:
+            raise DfuError("bootloader DFU characteristics not found")
+        self.responses = await self.bz.start_notify(self.control)
+        try:
+            mtu = await self.bz.get(self.packet, "org.bluez.GattCharacteristic1", "MTU")
+        except DfuError:
+            mtu = 23
+        self.chunk = max(20, min(mtu - 3, 244))
+        log(f"  bootloader ready, MTU {mtu}, chunk {self.chunk} bytes")
+
+    async def request(self, payload, timeout=20):
+        while not self.responses.empty():
+            self.responses.get_nowait()
+        await self.bz.write(self.control, payload)
+        while True:
+            resp = await asyncio.wait_for(self.responses.get(), timeout)
+            if len(resp) >= 3 and resp[0] == OP_RESPONSE and resp[1] == payload[0]:
+                break
+        if resp[2] != 0x01:
+            reason = RESULTS.get(resp[2], hex(resp[2]))
+            if resp[2] == 0x0B and len(resp) > 3:
+                reason += ": " + EXT_ERRORS.get(resp[3], hex(resp[3]))
+            raise DfuError(f"opcode 0x{payload[0]:02x} failed: {reason}")
+        return resp[3:]
+
+    async def select(self, obj):
+        max_size, offset, crc = struct.unpack("<III", await self.request(bytes([OP_SELECT, obj])))
+        return max_size, offset, crc
+
+    async def crc(self):
+        return struct.unpack("<II", await self.request(bytes([OP_CRC])))
+
+    async def send_object(self, obj, data, base, whole):
+        """Create one object, stream it and verify the running CRC."""
+        for attempt in range(1, 4):
+            await self.request(bytes([OP_CREATE, obj]) + struct.pack("<I", len(data)))
+            for i in range(0, len(data), self.chunk):
+                await self.bz.write(self.packet, data[i:i + self.chunk], command=True)
+            offset, crc = await self.crc()
+            end = base + len(data)
+            if offset == end and crc == zlib.crc32(whole[:end]):
+                await self.request(bytes([OP_EXECUTE]), timeout=60)
+                return
+            log(f"  CRC mismatch at {base} (offset {offset}/{end}), retrying object ({attempt}/3)")
+        raise DfuError(f"object at {base} failed CRC three times")
+
+    async def run(self, init, firmware):
+        await self.request(bytes([OP_PRN, 0x00, 0x00]))
+
+        max_size, offset, crc = await self.select(OBJ_COMMAND)
+        if len(init) > max_size:
+            raise DfuError(f"init packet {len(init)} > {max_size}")
+        log("  sending init packet...")
+        await self.send_object(OBJ_COMMAND, init, 0, init)
+
+        max_size, offset, crc = await self.select(OBJ_DATA)
+        start = 0
+        if 0 < offset <= len(firmware) and crc == zlib.crc32(firmware[:offset]):
+            start = offset - (offset % max_size)
+            log(f"  resuming at {start} (bootloader already had {offset} bytes)")
+        total = len(firmware)
+        last_pct = -1
+        for base in range(start, total, max_size):
+            await self.send_object(OBJ_DATA, firmware[base:base + max_size], base, firmware)
+            pct = (base + min(max_size, total - base)) * 100 // total
+            if pct // 5 != last_pct // 5:
+                log(f"  {pct}%  ({base + min(max_size, total - base)}/{total} bytes)")
+                last_pct = pct
+
+
+def load_package(path):
+    with zipfile.ZipFile(path) as z:
+        manifest = json.loads(z.read("manifest.json"))["manifest"]
+        part = manifest.get("application") or next(iter(manifest.values()))
+        return z.read(part["dat_file"]), z.read(part["bin_file"])
+
+
+async def cmd_flash(bz, mac, package):
+    init, firmware = load_package(package)
+    log(f"package: {os.path.basename(package)}  init {len(init)} B, firmware {len(firmware)} B")
+
+    app_path = dev_path(mac)
+    boot_mac = mac_plus_one(mac)
+    boot_path = dev_path(boot_mac)
+
+    def is_bootloader(path, props):
+        return path in (boot_path, app_path) and props.get("Name", Variant("s", "")).value == "DfuTarg"
+
+    log(f"== {mac}")
+    boot = None
+    if await bz.device_exists(boot_path) or await bz.device_exists(app_path):
+        # An earlier run may have left it in the bootloader already.
+        boot = await bz.discover(is_bootloader, 4)
+    if boot is None:
+        path = await ensure_connected(bz, mac)
+        log("  current firmware:", await read_version(bz, path))
+        buttonless = await bz.find_char(path, UUID_BUTTONLESS)
+        if not buttonless:
+            raise DfuError("no buttonless DFU characteristic")
+        indications = await bz.start_notify(buttonless)
+        log("  indications enabled, switching station to bootloader...")
+        try:
+            await bz.write(buttonless, [0x01])
+            log("  enter-bootloader write acknowledged")
+        except DfuError as e:
+            # The station may reset before BlueZ gets the write response.
+            log(f"  enter-bootloader write: {e}")
+        try:
+            resp = await asyncio.wait_for(indications.get(), 10)
+            log(f"  buttonless response: {resp.hex()}")
+            if resp[:3] != bytes([0x20, 0x01, 0x01]):
+                raise DfuError(f"enter-bootloader refused: {resp.hex()}")
+        except asyncio.TimeoutError:
+            log("  (no indication, continuing)")
+        log("  disconnecting...")
+        await bz.disconnect_device(path)
+        await asyncio.sleep(2)
+        log(f"  waiting for DfuTarg ({boot_mac} or {mac})...")
+        boot = await bz.discover(is_bootloader, 30)
+        if boot is None:
+            raise DfuError("bootloader did not show up")
+
+    log(f"  bootloader at {boot}")
+    await bz.connect_device(boot)
+    session = DfuSession(bz, boot)
+    await session.open()
+    await session.run(init, firmware)
+    log("  image validated, station is rebooting into the new firmware")
+    await bz.disconnect_device(boot)
+
+    await asyncio.sleep(15)
+    try:
+        await bz.disconnect_device(app_path)
+        path = await ensure_connected(bz, mac)
+        log("  new firmware:", await read_version(bz, path))
+        await bz.disconnect_device(path)
+    except DfuError as e:
+        log(f"  could not read back the version yet: {e}")
+
+
+async def cmd_dfu(bz, package):
+    """Flash whichever station sits in its bootloader (LHB-DFU)."""
+    init, firmware = load_package(package)
+    log(f"package: {os.path.basename(package)}  init {len(init)} B, firmware {len(firmware)} B")
+    log("looking for a station in bootloader mode (LHB-DFU)...")
+    boot = await bz.discover(
+        lambda path, props: props.get("Name", Variant("s", "")).value in ("LHB-DFU", "DfuTarg")
+        and "RSSI" in props, 60)
+    if boot is None:
+        raise DfuError("no LHB-DFU device found - hold the back button while plugging in power")
+    log(f"  bootloader at {boot}")
+    await bz.connect_device(boot)
+    session = DfuSession(bz, boot)
+    await session.open()
+    await session.run(init, firmware)
+    await bz.disconnect_device(boot)
+    log("DONE: image validated. Unplug the station's power, plug it back in and wait for the green LED.")
+
+
+async def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p_info = sub.add_parser("info")
+    p_info.add_argument("mac", nargs="+")
+    p_flash = sub.add_parser("flash")
+    p_flash.add_argument("mac")
+    p_flash.add_argument("--package", default=DEFAULT_PACKAGE)
+    p_dfu = sub.add_parser("dfu")
+    p_dfu.add_argument("--package", default=DEFAULT_PACKAGE)
+    args = ap.parse_args()
+
+    bz = await Bluez.connect()
+    try:
+        if args.cmd == "info":
+            await cmd_info(bz, args.mac)
+        elif args.cmd == "dfu":
+            await cmd_dfu(bz, args.package)
+        elif not os.environ.get("LH_DFU_FORCE"):
+            log("flash is disabled: Valve stations need SteamVR's own authentication to enter DFU (see docstring)")
+            sys.exit(2)
+        else:
+            await cmd_flash(bz, args.mac.upper(), args.package)
+    except DfuError as e:
+        log(f"ERROR: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
