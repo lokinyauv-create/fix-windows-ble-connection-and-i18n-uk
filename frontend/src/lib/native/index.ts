@@ -6,8 +6,16 @@ import { WebsocketContext, type WebsocketContextType } from "../context/websocke
 import * as native from "../../../wailsjs/go/main/App"
 type status = "ok" | string
 
-export const ChangeBaseStationPowerStatus = async (id: string, mode: "sleep" | "awake") => {
-    await native.ChangeBaseStationPowerStatus(id, mode);
+export const ChangeBaseStationPowerStatus = async (id: string, mode: "sleep" | "awake"): Promise<status> => {
+    return native.ChangeBaseStationPowerStatus(id, mode);
+}
+
+export const Shutdown = async () => {
+    return native.Shutdown();
+}
+
+export const IsSteamVRConnected = async (): Promise<boolean> => {
+    return native.IsSteamVRConnected();
 }
 
 export const RenameGroup = async (old: string, newName: string) => {

@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"io"
 	"log"
 	"os"
+	"os/signal"
 	"path"
 	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	_ "embed"
@@ -40,6 +44,8 @@ var BINARY_VERSION string
 type App struct {
 	ctx                   context.Context
 	bluetoothInitFinished bool
+	windowHidden          atomic.Bool
+	reconnecting          atomic.Bool
 }
 
 func NewApp() *App {
@@ -53,14 +59,19 @@ func (a *App) UpdateConfigValue(name string, value interface{}) {
 }
 func (a *App) startup(ctx context.Context) {
 
-	if !strings.Contains(VERSION_FLAGS, "DEBUG") {
-		f, err := os.OpenFile(path.Join(GetConfigFolder(), "log.txt"), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
-		if err != nil {
-			log.Fatalf("error opening file: %v", err)
-		}
-		defer f.Close()
-
-		log.SetOutput(f)
+	// Always keep a log file, and deliberately never close it. This used to be
+	// skipped entirely for DEBUG builds and, worse, the handle was closed as
+	// soon as startup returned - so log.txt only ever held the first few lines
+	// and a problem that showed up later left no trace at all. That matters
+	// most when SteamVR auto-launches us, because then there is no console to
+	// read either.
+	if f, err := os.OpenFile(path.Join(GetConfigFolder(), "log.txt"), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666); err != nil {
+		log.Printf("Failed to open log file, logging to stdout only: %v\n", err)
+	} else {
+		// File first: MultiWriter stops at the first writer that errors, and a
+		// GUI process launched without a console (SteamVR does exactly that)
+		// has no usable stdout - putting it first swallowed the whole log.
+		log.SetOutput(io.MultiWriter(f, os.Stdout))
 	}
 
 	log.Printf("Version flags: %s\n", VERSION_FLAGS)
@@ -74,7 +85,7 @@ func (a *App) startup(ctx context.Context) {
 			running, _ := isProcRunning("vrserver.exe")
 
 			if !running && config.IsSteamVRManaged {
-				wruntime.WindowShow(a.ctx)
+				a.ShowFromTray()
 			}
 
 			WEBSOCKET_BROADCAST.Broadcast(preparePacket("steamvr.status", map[string]interface{}{
@@ -84,12 +95,21 @@ func (a *App) startup(ctx context.Context) {
 	}()
 
 	config = GetConfiguration()
-	a.InitBluetooth()
+
+	// Only bring the adapter up here. Starting an advertisement scan at this
+	// point (as InitBluetooth does) makes the radio scan while
+	// preloadBaseStations is enumerating GATT services on the known base
+	// stations, and on Windows that makes service discovery hang forever.
+	// Scanning is started on demand instead - see StartScanFor10Seconds.
+	a.EnableBluetooth()
 
 	go a.preloadBaseStations()
 
 	if config.IsSteamVRManaged && runtime.GOOS == "windows" {
 		if running, _ := isProcRunning("vrserver.exe"); running {
+			// A session is already live, so keep the links and just get out of
+			// the way - HideToTray would hand the stations back mid-session.
+			a.windowHidden.Store(true)
 			wruntime.WindowHide(a.ctx)
 		}
 	}
@@ -97,6 +117,120 @@ func (a *App) startup(ctx context.Context) {
 	go initializeSystray(a)
 	go StartHttp()
 
+	a.watchForTermination()
+}
+
+// disconnectAllBaseStations drops every live BLE link we hold. A base station
+// only accepts one connection at a time, so a link we leave open keeps it
+// unusable from any other machine. On Linux this matters even more: BlueZ owns
+// the connection at the daemon level, so it survives the process exiting and
+// the station stays claimed until something explicitly disconnects it.
+func disconnectAllBaseStations() {
+	// A sleep command sent right before exit is still being re-sent to the
+	// write-only stations; disconnecting now would leave them with a single
+	// attempt, which they sometimes ignore. Give the confirmation loops time
+	// to finish first.
+	deadline := time.Now().Add(16 * time.Second)
+	for time.Now().Before(deadline) {
+		pending := false
+		for _, bs := range knownBaseStations.Items() {
+			if bs != nil && (*bs).PowerCommandPending() {
+				pending = true
+				break
+			}
+		}
+		if !pending {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+
+	for name, bs := range knownBaseStations.Items() {
+		if bs == nil {
+			continue
+		}
+
+		log.Printf("Disconnecting from base station %s before exit\n", name)
+		(*bs).Disconnect()
+	}
+}
+
+// anyBaseStationConnected reports whether we currently hold at least one link.
+func anyBaseStationConnected() bool {
+	for _, bs := range knownBaseStations.Items() {
+		if bs != nil && (*bs).GetStatus() == "ready" {
+			return true
+		}
+	}
+	return false
+}
+
+// HideToTray hides the window, keeping the base station links.
+//
+// It used to hand the stations back here so they'd stay usable from another
+// machine, but disconnecting mid-life poisons the process: tinygo's Windows
+// Disconnect returns early when closing the GATT session fails, so the device
+// handle is never closed and every later connect comes back with the service
+// but no characteristics. The app quits when SteamVR exits now, and that
+// releases the stations just as well - a process on its way out can't be
+// poisoned by a failed disconnect.
+func (a *App) HideToTray() {
+	a.windowHidden.Store(true)
+	wruntime.WindowHide(a.ctx)
+}
+
+// ShowFromTray brings the window back and re-establishes any link we dropped
+// while idling in the tray.
+func (a *App) ShowFromTray() {
+	a.windowHidden.Store(false)
+	wruntime.WindowShow(a.ctx)
+	a.ReconnectBaseStations()
+}
+
+// ReconnectBaseStations re-runs the preload pass, rebuilding links we released.
+// It is a no-op while a previous pass is still in flight or everything is
+// already connected.
+func (a *App) ReconnectBaseStations() {
+	if anyBaseStationConnected() {
+		return
+	}
+
+	if !a.reconnecting.CompareAndSwap(false, true) {
+		return
+	}
+
+	go func() {
+		defer a.reconnecting.Store(false)
+
+		log.Println("Reconnecting to base stations...")
+		a.preloadBaseStations()
+
+		// preloadBaseStations only kicks off the connection goroutines, so give
+		// them a moment before another caller is allowed to retry.
+		time.Sleep(10 * time.Second)
+	}()
+}
+
+// watchForTermination releases the base stations when the process is asked to
+// quit from outside the UI (Ctrl+C, `kill`, a logout). SIGKILL can't be caught,
+// so a `kill -9` still leaves the stations claimed on Linux.
+func (a *App) watchForTermination() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		sig := <-signals
+		log.Printf("Received %v, releasing base stations before exit\n", sig)
+		disconnectAllBaseStations()
+		os.Exit(0)
+	}()
+}
+
+// shutdown is wired to Wails' OnShutdown so closing the window releases the
+// base stations. Without it the app exits still holding them.
+func (a *App) shutdown(ctx context.Context) {
+	log.Println("Shutting down, releasing base stations...")
+	disconnectAllBaseStations()
 }
 
 func (a *App) CreateGroup(name string, baseStations []string) string {
@@ -200,6 +334,20 @@ func (a *App) preloadBaseStations() {
 
 	steamVrRunning, _ := isProcRunning("vrserver.exe")
 	for name, baseStation := range config.KnownBaseStations {
+		// Don't start a second attempt on a station that is already connected
+		// or already being connected to. A power command arriving while the
+		// startup pass is still running used to trigger a whole second pass
+		// through ReconnectBaseStations, and the two chains then fought over
+		// the station's single BLE link: one got the characteristics, the other
+		// got an empty list, and both churned until they gave up.
+		if existing, ok := knownBaseStations.Get(name); ok && existing != nil && (*existing).GetStatus() == "ready" {
+			continue
+		}
+
+		if BaseStationIsConnecting(baseStation.Id) {
+			continue
+		}
+
 		log.Printf("Preload base station: %s %+v\n", name, baseStation)
 		preloadedBaseStation := PreloadBaseStation(*baseStation, steamVrRunning && ((baseStation.ManagedFlags&2) > 0))
 		knownBaseStations.Set(name, &preloadedBaseStation)
@@ -337,20 +485,24 @@ func (a *App) StartScanFor10Seconds() {
 	}))
 }
 
-func (a *App) InitBluetooth() bool {
+// EnableBluetooth brings up the adapter without starting a scan.
+func (a *App) EnableBluetooth() bool {
 
 	if a.bluetoothInitFinished {
 		return true
 	}
 
 	if err := adapter.Enable(); err != nil {
+		log.Printf("Failed to enable bluetooth adapter: %+v\n", err)
 		return false
 	}
 
-	go a.StartScanFor10Seconds()
-
 	a.bluetoothInitFinished = true
 	return true
+}
+
+func (a *App) InitBluetooth() bool {
+	return a.EnableBluetooth()
 }
 
 func ScanCallback(app *App, a *bluetooth.Adapter, sr bluetooth.ScanResult) {
@@ -404,10 +556,33 @@ func ScanCallback(app *App, a *bluetooth.Adapter, sr bluetooth.ScanResult) {
 }
 
 func (a *App) ChangeBaseStationPowerStatus(baseStationMac string, status string) string {
+	log.Printf("Power command requested: %s -> %s\n", baseStationMac, status)
+
 	baseStation, found := knownBaseStations.Get(baseStationMac)
 
 	if !found {
+		log.Printf("Power command failed, %s is not a known base station\n", baseStationMac)
 		return "Unknown base station"
+	}
+
+	// The link may have been released while idling in the tray, so bring it
+	// back before trying to write. This is what lets the SteamVR automation
+	// still work after we've handed the stations back to the other machine.
+	if (*baseStation).GetStatus() != "ready" {
+		a.ReconnectBaseStations()
+
+		for i := 0; i < 30; i++ {
+			time.Sleep(time.Second)
+			if refreshed, ok := knownBaseStations.Get(baseStationMac); ok && (*refreshed).GetStatus() == "ready" {
+				baseStation = refreshed
+				break
+			}
+		}
+
+		if (*baseStation).GetStatus() != "ready" {
+			log.Printf("Could not reconnect to %s in time to change power state\n", baseStationMac)
+			return "error: base station not connected"
+		}
 	}
 
 	bs := *baseStation
@@ -464,12 +639,7 @@ func (a *App) IdentitifyBaseStation(baseStationMac string) string {
 }
 
 func (a *App) Shutdown() {
-	for _, bs := range knownBaseStations.Items() {
-
-		if bs != nil {
-			(*bs).Disconnect()
-		}
-	}
+	disconnectAllBaseStations()
 
 	shutdownSystray()
 	os.Exit(0)

@@ -6,14 +6,15 @@ import { ChangeBaseStationPowerStatus, IdentitifyBaseStation } from "@src/lib/na
 import { StatusCircleIcon } from "../assets/icons/StatusCircleIcon";
 import { route } from "preact-router";
 import { useTranslation } from "react-i18next";
-import { ChevronRightIcon, CirclePower, Eye } from "lucide-preact";
+import { ChevronRightIcon, Eye, Power, PowerOff } from "lucide-preact";
 import type { LighthouseStation } from "@src/lib/types/index";
 import { useWebsocketCommunication } from "@src/lib/hooks/useWebsocketCommunication";
+import { isAwake, isUnknown } from "@src/lib/powerState";
 
 
 export function BaseStation({ station, onSelect, selected, editMode }: { station: LighthouseStation, onSelect?: () => void, selected: boolean, editMode?: boolean }) {
 
-    const isAwoke = [0x0B, 0x01, 0x09].includes(station.power_state);
+    const isAwoke = isAwake(station.power_state);
     const send = useWebsocketCommunication();
 
     const [identitfyDisabled, setIdentitfyhDisabled] = useState(false);
@@ -30,15 +31,25 @@ export function BaseStation({ station, onSelect, selected, editMode }: { station
         }, 20000)
     }
 
-    const updatePowerState = async () => {
-        if (isAwoke) {
-            //Sleeping of
-            let result = await ChangeBaseStationPowerStatus(station.id, "sleep");
-            return;
-        }
+    const [powerBusy, setPowerBusy] = useState(false);
 
-        //Waking it up
-        await ChangeBaseStationPowerStatus(station.id, "awake");
+    // Explicit commands rather than one toggle: on Windows the power
+    // characteristic is write-only, so the app can't tell whether a station is
+    // on. A toggle would have to guess, and a wrong guess sends the opposite of
+    // what was wanted.
+    const setPower = async (mode: "awake" | "sleep") => {
+        // Held only while the command is in flight - it can take a while when
+        // the station has to be reconnected first, and overlapping presses
+        // would race. A press with nothing in flight always goes through.
+        if (powerBusy) return;
+        setPowerBusy(true);
+
+        try {
+            const result = await ChangeBaseStationPowerStatus(station.id, mode);
+            if (result != "ok") alert(result);
+        } finally {
+            setPowerBusy(false);
+        }
     }
 
     const { t } = useTranslation();
@@ -48,6 +59,10 @@ export function BaseStation({ station, onSelect, selected, editMode }: { station
         if (station.status == "error") return "error";
 
         if (station.status != "ready") return "preloaded"
+
+        // Don't claim the station is asleep when we simply never managed to
+        // read its power state - show it as unknown instead.
+        if (isUnknown(station.power_state)) return "unknown"
 
         return isAwoke ? "awoke" : "sleep"
     }, [station.power_state, station.status])
@@ -60,7 +75,7 @@ export function BaseStation({ station, onSelect, selected, editMode }: { station
             <div className="flex flex-col gap-[2px] text-[14px]">
                 <span className="flex flex-row gap-[6px] items-center">
                     <span>{station.name} </span>
-                    <StatusCircleIcon class={`data-[status="sleep"]:fill-red-500 data-[status="preloaded"]:fill-blue-500 data-[status="awoke"]:fill-green-500 duration-300`} data-status={baseStationStatus} />
+                    <StatusCircleIcon class={`data-[status="sleep"]:fill-red-500 data-[status="preloaded"]:fill-blue-500 data-[status="awoke"]:fill-green-500 data-[status="unknown"]:fill-neutral-500 duration-300`} data-status={baseStationStatus} />
 
                 </span>
                 <AnimatePresence mode="wait">
@@ -89,10 +104,15 @@ export function BaseStation({ station, onSelect, selected, editMode }: { station
                 </motion.div>
                     : null}
 
-                {!editMode && <motion.div key={"awoke"} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-                    {station.status == "ready" && <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={updatePowerState}>
-                        <CirclePower color="#C6C6C6" strokeWidth={2} />
-                    </button>}
+                {!editMode && <motion.div key={"awoke"} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="flex flex-row gap-[8px]">
+                    {station.status == "ready" && <>
+                        <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={() => setPower("awake")} disabled={powerBusy} title={t("Turn on")}>
+                            <Power color="#C6C6C6" strokeWidth={2} />
+                        </button>
+                        <button className="opacity-75 hover:opacity-100 duration-150 disabled:opacity-25 cursor-pointer p-1 border-[#C6C6C6] border-none rounded-md" onClick={() => setPower("sleep")} disabled={powerBusy} title={t("Turn off")}>
+                            <PowerOff color="#C6C6C6" strokeWidth={2} />
+                        </button>
+                    </>}
                 </motion.div>}
 
                 {!editMode && <motion.div key={"open"} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>

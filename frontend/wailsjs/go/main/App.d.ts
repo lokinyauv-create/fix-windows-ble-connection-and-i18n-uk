@@ -10,6 +10,8 @@ export function ChangeBaseStationPowerStatus(arg1:string,arg2:string):Promise<st
 
 export function CreateGroup(arg1:string,arg2:Array<string>):Promise<string>;
 
+export function EnableBluetooth():Promise<boolean>;
+
 export function ForceUpdate():Promise<void>;
 
 export function ForgetBaseStation(arg1:string):Promise<void>;
@@ -19,6 +21,8 @@ export function GetConfiguration():Promise<main.Configuration>;
 export function GetFoundBaseStations():Promise<Record<string, main.JsonBaseStation>>;
 
 export function GetVersion():Promise<string>;
+
+export function HideToTray():Promise<void>;
 
 export function IdentitifyBaseStation(arg1:string):Promise<string>;
 
@@ -32,9 +36,13 @@ export function IsUpdatingSupported():Promise<boolean>;
 
 export function Notify(arg1:string,arg2:string):Promise<void>;
 
+export function ReconnectBaseStations():Promise<void>;
+
 export function RemoveGroup(arg1:string):Promise<void>;
 
 export function RenameGroup(arg1:string,arg2:string):Promise<string>;
+
+export function ShowFromTray():Promise<void>;
 
 export function Shutdown():Promise<void>;
 

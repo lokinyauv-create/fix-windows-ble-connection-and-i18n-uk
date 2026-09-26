@@ -1,0 +1,685 @@
+From 47cbfb26fbe5a9cddb824dce3a8701bba4ecc99a Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Tue, 4 Aug 2026 03:13:49 +0200
+Subject: [PATCH 1/5] fix: release base stations on exit instead of leaving
+ them claimed
+
+App.Shutdown() already disconnected every base station, but nothing
+ever called it - main.go only wired up OnStartup, so closing the
+window exited with all BLE links still open.
+
+That matters because a base station only accepts one connection at a
+time. On Linux it's worse still: BlueZ owns the connection at the
+daemon level, so it survives the process exiting entirely. Confirmed
+on a live setup - after the app was gone, `bluetoothctl` still
+reported `Connected: yes`, and no other machine could use that
+station until something ran an explicit `bluetoothctl disconnect`.
+Symptoms that looked like dead hardware ("station stuck, needs a
+power-cycle") were really just a leaked connection.
+
+Wire the disconnect into Wails' OnShutdown so closing the window
+releases them, and handle SIGINT/SIGTERM for the same reason when the
+app is launched from a terminal. SIGKILL still can't be caught, so
+`kill -9` will keep leaking on Linux.
+
+Verified on both platforms: the log now shows "releasing base
+stations" on exit, and on Linux `bluetoothctl devices Connected` is
+empty afterwards where it previously still listed the station.
+
+(cherry picked from commit 8062ec58dd0f2d0efa4b78f8cbfd713271122099)
+---
+ app.go  | 48 ++++++++++++++++++++++++++++++++++++++++++------
+ main.go |  1 +
+ 2 files changed, 43 insertions(+), 6 deletions(-)
+
+diff --git a/app.go b/app.go
+index 03b18a4..9ea7598 100644
+--- a/app.go
++++ b/app.go
+@@ -5,10 +5,12 @@ import (
+ 	"io"
+ 	"log"
+ 	"os"
++	"os/signal"
+ 	"path"
+ 	"runtime"
+ 	"slices"
+ 	"strings"
++	"syscall"
+ 	"time"
+ 
+ 	_ "embed"
+@@ -109,6 +111,45 @@ func (a *App) startup(ctx context.Context) {
+ 	go initializeSystray(a)
+ 	go StartHttp()
+ 
++	a.watchForTermination()
++}
++
++// disconnectAllBaseStations drops every live BLE link we hold. A base station
++// only accepts one connection at a time, so a link we leave open keeps it
++// unusable from any other machine. On Linux this matters even more: BlueZ owns
++// the connection at the daemon level, so it survives the process exiting and
++// the station stays claimed until something explicitly disconnects it.
++func disconnectAllBaseStations() {
++	for name, bs := range knownBaseStations.Items() {
++		if bs == nil {
++			continue
++		}
++
++		log.Printf("Disconnecting from base station %s before exit\n", name)
++		(*bs).Disconnect()
++	}
++}
++
++// watchForTermination releases the base stations when the process is asked to
++// quit from outside the UI (Ctrl+C, `kill`, a logout). SIGKILL can't be caught,
++// so a `kill -9` still leaves the stations claimed on Linux.
++func (a *App) watchForTermination() {
++	signals := make(chan os.Signal, 1)
++	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
++
++	go func() {
++		sig := <-signals
++		log.Printf("Received %v, releasing base stations before exit\n", sig)
++		disconnectAllBaseStations()
++		os.Exit(0)
++	}()
++}
++
++// shutdown is wired to Wails' OnShutdown so closing the window releases the
++// base stations. Without it the app exits still holding them.
++func (a *App) shutdown(ctx context.Context) {
++	log.Println("Shutting down, releasing base stations...")
++	disconnectAllBaseStations()
+ }
+ 
+ func (a *App) CreateGroup(name string, baseStations []string) string {
+@@ -497,12 +538,7 @@ func (a *App) IdentitifyBaseStation(baseStationMac string) string {
+ }
+ 
+ func (a *App) Shutdown() {
+-	for _, bs := range knownBaseStations.Items() {
+-
+-		if bs != nil {
+-			(*bs).Disconnect()
+-		}
+-	}
++	disconnectAllBaseStations()
+ 
+ 	shutdownSystray()
+ 	os.Exit(0)
+diff --git a/main.go b/main.go
+index c6e68b1..3ca034c 100644
+--- a/main.go
++++ b/main.go
+@@ -42,6 +42,7 @@ func main() {
+ 		Frameless:        true,
+ 		BackgroundColour: &options.RGBA{R: 18, G: 18, B: 18, A: 1},
+ 		OnStartup:        app.startup,
++		OnShutdown:       app.shutdown,
+ 		Windows: &windows.Options{
+ 			IsZoomControlEnabled: false,
+ 		},
+-- 
+2.55.0
+
+
+From ddce0e6ba2d3498f63b31623fe856b9667a9fbb9 Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Tue, 4 Aug 2026 03:59:14 +0200
+Subject: [PATCH 2/5] fix: release base stations while sitting in the tray
+
+With "Allow tray" on, the close button hides the window instead of
+quitting, so the process keeps running - and kept holding every base
+station. A station only accepts one connection at a time, so a second
+machine could never connect while the app sat in the tray. From the
+user's side it looks like they quit the app but the stations stay
+locked, with no way to hand them over short of killing the process.
+
+Hiding to tray now drops the links, and they're re-established when
+the window comes back (tray "Show", a second launch) or when a power
+command needs them - ChangeBaseStationPowerStatus reconnects on
+demand, so the SteamVR automation still works from the tray. A
+background watcher covers the remaining case: once SteamVR exits and
+the stations have been put to sleep, the now-idle links are dropped
+too.
+
+Links are kept, not dropped, when the window hides while a VR session
+is already running - that machine is actively using them.
+
+(cherry picked from commit 40b49048ba55dce244675261572cd63c912aa322)
+---
+ app.go                               | 114 ++++++++++++++++++++++++++-
+ frontend/src/components/TitleBar.tsx |   4 +-
+ frontend/wailsjs/go/main/App.d.ts    |   6 ++
+ frontend/wailsjs/go/main/App.js      |  12 +++
+ systray_windows.go                   |   3 +-
+ 5 files changed, 135 insertions(+), 4 deletions(-)
+
+diff --git a/app.go b/app.go
+index 9ea7598..5c7ebe4 100644
+--- a/app.go
++++ b/app.go
+@@ -10,6 +10,7 @@ import (
+ 	"runtime"
+ 	"slices"
+ 	"strings"
++	"sync/atomic"
+ 	"syscall"
+ 	"time"
+ 
+@@ -43,6 +44,8 @@ var BINARY_VERSION string
+ type App struct {
+ 	ctx                   context.Context
+ 	bluetoothInitFinished bool
++	windowHidden          atomic.Bool
++	reconnecting          atomic.Bool
+ }
+ 
+ func NewApp() *App {
+@@ -82,7 +85,7 @@ func (a *App) startup(ctx context.Context) {
+ 			running, _ := isProcRunning("vrserver.exe")
+ 
+ 			if !running && config.IsSteamVRManaged {
+-				wruntime.WindowShow(a.ctx)
++				a.ShowFromTray()
+ 			}
+ 
+ 			WEBSOCKET_BROADCAST.Broadcast(preparePacket("steamvr.status", map[string]interface{}{
+@@ -104,6 +107,9 @@ func (a *App) startup(ctx context.Context) {
+ 
+ 	if config.IsSteamVRManaged && runtime.GOOS == "windows" {
+ 		if running, _ := isProcRunning("vrserver.exe"); running {
++			// A session is already live, so keep the links and just get out of
++			// the way - HideToTray would hand the stations back mid-session.
++			a.windowHidden.Store(true)
+ 			wruntime.WindowHide(a.ctx)
+ 		}
+ 	}
+@@ -112,6 +118,7 @@ func (a *App) startup(ctx context.Context) {
+ 	go StartHttp()
+ 
+ 	a.watchForTermination()
++	a.releaseWhenIdle()
+ }
+ 
+ // disconnectAllBaseStations drops every live BLE link we hold. A base station
+@@ -130,6 +137,91 @@ func disconnectAllBaseStations() {
+ 	}
+ }
+ 
++// anyBaseStationConnected reports whether we currently hold at least one link.
++func anyBaseStationConnected() bool {
++	for _, bs := range knownBaseStations.Items() {
++		if bs != nil && (*bs).GetStatus() == "ready" {
++			return true
++		}
++	}
++	return false
++}
++
++// HideToTray hides the window and lets go of the base stations. Sitting in the
++// tray holding them would keep them unusable from any other machine, and we
++// don't need the links until the window comes back or a VR session starts.
++func (a *App) HideToTray() {
++	a.windowHidden.Store(true)
++	wruntime.WindowHide(a.ctx)
++
++	if running, _ := isProcRunning("vrserver.exe"); running {
++		// A session is live - the automation still needs the links.
++		return
++	}
++
++	log.Println("Hidden to tray with no VR session - releasing base stations")
++	disconnectAllBaseStations()
++}
++
++// ShowFromTray brings the window back and re-establishes any link we dropped
++// while idling in the tray.
++func (a *App) ShowFromTray() {
++	a.windowHidden.Store(false)
++	wruntime.WindowShow(a.ctx)
++	a.ReconnectBaseStations()
++}
++
++// ReconnectBaseStations re-runs the preload pass, rebuilding links we released.
++// It is a no-op while a previous pass is still in flight or everything is
++// already connected.
++func (a *App) ReconnectBaseStations() {
++	if anyBaseStationConnected() {
++		return
++	}
++
++	if !a.reconnecting.CompareAndSwap(false, true) {
++		return
++	}
++
++	go func() {
++		defer a.reconnecting.Store(false)
++
++		log.Println("Reconnecting to base stations...")
++		a.preloadBaseStations()
++
++		// preloadBaseStations only kicks off the connection goroutines, so give
++		// them a moment before another caller is allowed to retry.
++		time.Sleep(10 * time.Second)
++	}()
++}
++
++// releaseWhenIdle drops the BLE links whenever the app is sitting in the tray
++// with no VR session running - e.g. after SteamVR exits and the stations have
++// been put to sleep. Without this the app would keep them claimed for as long
++// as it stays in the tray.
++func (a *App) releaseWhenIdle() {
++	go func() {
++		for {
++			time.Sleep(15 * time.Second)
++
++			if !a.windowHidden.Load() {
++				continue
++			}
++
++			if running, _ := isProcRunning("vrserver.exe"); running {
++				continue
++			}
++
++			if !anyBaseStationConnected() {
++				continue
++			}
++
++			log.Println("Idle in tray with no VR session - releasing base stations")
++			disconnectAllBaseStations()
++		}
++	}()
++}
++
+ // watchForTermination releases the base stations when the process is asked to
+ // quit from outside the UI (Ctrl+C, `kill`, a logout). SIGKILL can't be caught,
+ // so a `kill -9` still leaves the stations claimed on Linux.
+@@ -484,6 +576,26 @@ func (a *App) ChangeBaseStationPowerStatus(baseStationMac string, status string)
+ 		return "Unknown base station"
+ 	}
+ 
++	// The link may have been released while idling in the tray, so bring it
++	// back before trying to write. This is what lets the SteamVR automation
++	// still work after we've handed the stations back to the other machine.
++	if (*baseStation).GetStatus() != "ready" {
++		a.ReconnectBaseStations()
++
++		for i := 0; i < 30; i++ {
++			time.Sleep(time.Second)
++			if refreshed, ok := knownBaseStations.Get(baseStationMac); ok && (*refreshed).GetStatus() == "ready" {
++				baseStation = refreshed
++				break
++			}
++		}
++
++		if (*baseStation).GetStatus() != "ready" {
++			log.Printf("Could not reconnect to %s in time to change power state\n", baseStationMac)
++			return "error: base station not connected"
++		}
++	}
++
+ 	bs := *baseStation
+ 	switch status {
+ 	case "standingby":
+diff --git a/frontend/src/components/TitleBar.tsx b/frontend/src/components/TitleBar.tsx
+index 8ae4d03..c2ab1ec 100644
+--- a/frontend/src/components/TitleBar.tsx
++++ b/frontend/src/components/TitleBar.tsx
+@@ -95,8 +95,10 @@ export function TitleBar() {
+ 
+ 
+         if (config.allow_tray) {
++            // HideToTray also releases the base stations, so they stay usable
++            // from another machine while we sit in the tray.
+             //@ts-ignore
+-            await window.runtime.Hide()
++            await window.go.main.App.HideToTray()
+ 
+             if (!config.tray_notified) {
+                 //@ts-ignore
+diff --git a/frontend/wailsjs/go/main/App.d.ts b/frontend/wailsjs/go/main/App.d.ts
+index 5b59667..592ec39 100755
+--- a/frontend/wailsjs/go/main/App.d.ts
++++ b/frontend/wailsjs/go/main/App.d.ts
+@@ -22,6 +22,8 @@ export function GetFoundBaseStations():Promise<Record<string, main.JsonBaseStati
+ 
+ export function GetVersion():Promise<string>;
+ 
++export function HideToTray():Promise<void>;
++
+ export function IdentitifyBaseStation(arg1:string):Promise<string>;
+ 
+ export function InitBluetooth():Promise<boolean>;
+@@ -34,10 +36,14 @@ export function IsUpdatingSupported():Promise<boolean>;
+ 
+ export function Notify(arg1:string,arg2:string):Promise<void>;
+ 
++export function ReconnectBaseStations():Promise<void>;
++
+ export function RemoveGroup(arg1:string):Promise<void>;
+ 
+ export function RenameGroup(arg1:string,arg2:string):Promise<string>;
+ 
++export function ShowFromTray():Promise<void>;
++
+ export function Shutdown():Promise<void>;
+ 
+ export function SleepAllBaseStations():Promise<void>;
+diff --git a/frontend/wailsjs/go/main/App.js b/frontend/wailsjs/go/main/App.js
+index 3f8adec..13d98f6 100755
+--- a/frontend/wailsjs/go/main/App.js
++++ b/frontend/wailsjs/go/main/App.js
+@@ -42,6 +42,10 @@ export function GetVersion() {
+   return window['go']['main']['App']['GetVersion']();
+ }
+ 
++export function HideToTray() {
++  return window['go']['main']['App']['HideToTray']();
++}
++
+ export function IdentitifyBaseStation(arg1) {
+   return window['go']['main']['App']['IdentitifyBaseStation'](arg1);
+ }
+@@ -66,6 +70,10 @@ export function Notify(arg1, arg2) {
+   return window['go']['main']['App']['Notify'](arg1, arg2);
+ }
+ 
++export function ReconnectBaseStations() {
++  return window['go']['main']['App']['ReconnectBaseStations']();
++}
++
+ export function RemoveGroup(arg1) {
+   return window['go']['main']['App']['RemoveGroup'](arg1);
+ }
+@@ -74,6 +82,10 @@ export function RenameGroup(arg1, arg2) {
+   return window['go']['main']['App']['RenameGroup'](arg1, arg2);
+ }
+ 
++export function ShowFromTray() {
++  return window['go']['main']['App']['ShowFromTray']();
++}
++
+ export function Shutdown() {
+   return window['go']['main']['App']['Shutdown']();
+ }
+diff --git a/systray_windows.go b/systray_windows.go
+index 80c01d5..7f0a942 100644
+--- a/systray_windows.go
++++ b/systray_windows.go
+@@ -7,7 +7,6 @@ import (
+ 	"log"
+ 
+ 	"github.com/getlantern/systray"
+-	wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
+ )
+ 
+ // I REALLY SHOULD NOT DO THAT
+@@ -28,7 +27,7 @@ func (a *App) trayReady() {
+ 		for {
+ 			select {
+ 			case <-showWindowCh.ClickedCh:
+-				wruntime.WindowShow(a.ctx)
++				a.ShowFromTray()
+ 				continue
+ 			case <-wakeUpCh.ClickedCh:
+ 				a.WakeUpAllBaseStations()
+-- 
+2.55.0
+
+
+From d6c744e1765fbec8bc58df36d6444e9f5254761b Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Mon, 10 Aug 2026 14:56:12 +0200
+Subject: [PATCH 3/5] feat: quit once SteamVR exits and the stations are asleep
+
+With SteamVR auto-launching the app there is no reason for it to stay
+resident after the session ends - it just sits in the tray holding the
+base stations. Shut down instead once the session is over.
+
+Order matters: this runs after the sleep commands have finished rather
+than on the SteamVR event itself, because exiting first would cut them
+off halfway and leave the stations awake.
+
+Quitting can't be undone, so the SteamVR state is re-checked against
+the process directly before pulling the trigger - putting stations to
+sleep takes long enough that a new session may already have started.
+
+Only applies when "manage power based on SteamVR" is on, and only on a
+real running -> stopped transition, so starting the app by hand with no
+SteamVR around leaves it alone.
+
+(cherry picked from commit 6afec4cc06481b48e7eee4632fe71fb2d7f97b4a)
+---
+ frontend/src/components/TitleBar.tsx | 19 ++++++++++++++++++-
+ frontend/src/lib/native/index.ts     |  8 ++++++++
+ 2 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/frontend/src/components/TitleBar.tsx b/frontend/src/components/TitleBar.tsx
+index c2ab1ec..839e607 100644
+--- a/frontend/src/components/TitleBar.tsx
++++ b/frontend/src/components/TitleBar.tsx
+@@ -1,5 +1,5 @@
+ import { Power, PowerOff, SettingsIcon, X, XIcon } from "lucide-preact";
+-import { ChangeBaseStationPowerStatus, UpdateConfigValue } from "@src/lib/native/index";
++import { ChangeBaseStationPowerStatus, IsSteamVRConnected, Shutdown, UpdateConfigValue } from "@src/lib/native/index";
+ import { useContext, useEffect, useState } from "preact/hooks";
+ import { AnimatePresence, motion } from 'framer-motion';
+ import { PowerStatusIcon } from "../assets/icons/PowerStatusIcon";
+@@ -66,6 +66,23 @@ export function TitleBar() {
+             console.log("Putting in sleep mode")
+             const failures = await bulkUpdate("sleep", 4);
+             if (failures.length) console.error("Failed to sleep:", failures);
++
++            // The VR session is over and the stations have been put to sleep,
++            // so there is nothing left to stay resident for. Quitting here
++            // rather than on the SteamVR event itself matters: exiting first
++            // would kill the sleep commands halfway through, and SteamVR
++            // launches us again on the next session anyway.
++            //
++            // Quitting can't be undone, so confirm against the process itself
++            // rather than trusting the socket - putting the stations to sleep
++            // takes a while, and SteamVR may well be back up by now.
++            if (await IsSteamVRConnected()) {
++                console.log("SteamVR is running again, staying up")
++                return;
++            }
++
++            console.log("SteamVR exited, shutting down")
++            await Shutdown();
+         })()
+     }, [steamVRLaunched]);
+ 
+diff --git a/frontend/src/lib/native/index.ts b/frontend/src/lib/native/index.ts
+index 0f18e8c..37459b4 100644
+--- a/frontend/src/lib/native/index.ts
++++ b/frontend/src/lib/native/index.ts
+@@ -10,6 +10,14 @@ export const ChangeBaseStationPowerStatus = async (id: string, mode: "sleep" | "
+     return native.ChangeBaseStationPowerStatus(id, mode);
+ }
+ 
++export const Shutdown = async () => {
++    return native.Shutdown();
++}
++
++export const IsSteamVRConnected = async (): Promise<boolean> => {
++    return native.IsSteamVRConnected();
++}
++
+ export const RenameGroup = async (old: string, newName: string) => {
+     return native.RenameGroup(old, newName);
+ }
+-- 
+2.55.0
+
+
+From ffc2e4ad29edb3ecd600892529c9de688f05a751 Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Wed, 12 Aug 2026 07:47:52 +0200
+Subject: [PATCH 4/5] fix: keep the BLE links instead of releasing them while
+ idle in the tray
+
+Releasing the stations mid-life poisons the process. tinygo's Windows
+Disconnect returns early when closing the GATT session fails:
+
+	if err := d.session.Close(); err != nil {
+		return err          // d.device.Close() below never runs
+	}
+
+so BluetoothLEDevice.Close() is skipped and Windows keeps a half-open
+handle. Every connect afterwards still finds the service but comes
+back with an empty characteristic list.
+
+The log shows it exactly. Both stations connected at 21:48 and worked
+all night; at 07:26 the idle timer fired, the disconnect failed with
+"Incorrect function", and from that point every single attempt logged
+"Mode: false, Power: false, ID: false" - 39 of them, against two
+successes for the whole run. A fresh process always worked, which is
+why restarting the app kept appearing to fix it.
+
+Releasing existed so a station wouldn't sit claimed and unusable from
+another machine. That's covered better now: the app quits when SteamVR
+exits, which hands them back for real, and a process on its way out
+can't be poisoned by a failed disconnect. So keep the links while
+running and leave the disconnects on the exit paths only.
+
+Verified: over a minute idle in the tray with SteamVR closed, zero
+disconnects, zero "Mode: false", both stations still ready.
+
+(cherry picked from commit ecce72859b3a17666aa573bffcd16f9dfcf3a795)
+---
+ app.go | 48 +++++++++---------------------------------------
+ 1 file changed, 9 insertions(+), 39 deletions(-)
+
+diff --git a/app.go b/app.go
+index 5c7ebe4..dbf9cd2 100644
+--- a/app.go
++++ b/app.go
+@@ -118,7 +118,6 @@ func (a *App) startup(ctx context.Context) {
+ 	go StartHttp()
+ 
+ 	a.watchForTermination()
+-	a.releaseWhenIdle()
+ }
+ 
+ // disconnectAllBaseStations drops every live BLE link we hold. A base station
+@@ -147,20 +146,18 @@ func anyBaseStationConnected() bool {
+ 	return false
+ }
+ 
+-// HideToTray hides the window and lets go of the base stations. Sitting in the
+-// tray holding them would keep them unusable from any other machine, and we
+-// don't need the links until the window comes back or a VR session starts.
++// HideToTray hides the window, keeping the base station links.
++//
++// It used to hand the stations back here so they'd stay usable from another
++// machine, but disconnecting mid-life poisons the process: tinygo's Windows
++// Disconnect returns early when closing the GATT session fails, so the device
++// handle is never closed and every later connect comes back with the service
++// but no characteristics. The app quits when SteamVR exits now, and that
++// releases the stations just as well - a process on its way out can't be
++// poisoned by a failed disconnect.
+ func (a *App) HideToTray() {
+ 	a.windowHidden.Store(true)
+ 	wruntime.WindowHide(a.ctx)
+-
+-	if running, _ := isProcRunning("vrserver.exe"); running {
+-		// A session is live - the automation still needs the links.
+-		return
+-	}
+-
+-	log.Println("Hidden to tray with no VR session - releasing base stations")
+-	disconnectAllBaseStations()
+ }
+ 
+ // ShowFromTray brings the window back and re-establishes any link we dropped
+@@ -195,33 +192,6 @@ func (a *App) ReconnectBaseStations() {
+ 	}()
+ }
+ 
+-// releaseWhenIdle drops the BLE links whenever the app is sitting in the tray
+-// with no VR session running - e.g. after SteamVR exits and the stations have
+-// been put to sleep. Without this the app would keep them claimed for as long
+-// as it stays in the tray.
+-func (a *App) releaseWhenIdle() {
+-	go func() {
+-		for {
+-			time.Sleep(15 * time.Second)
+-
+-			if !a.windowHidden.Load() {
+-				continue
+-			}
+-
+-			if running, _ := isProcRunning("vrserver.exe"); running {
+-				continue
+-			}
+-
+-			if !anyBaseStationConnected() {
+-				continue
+-			}
+-
+-			log.Println("Idle in tray with no VR session - releasing base stations")
+-			disconnectAllBaseStations()
+-		}
+-	}()
+-}
+-
+ // watchForTermination releases the base stations when the process is asked to
+ // quit from outside the UI (Ctrl+C, `kill`, a logout). SIGKILL can't be caught,
+ // so a `kill -9` still leaves the stations claimed on Linux.
+-- 
+2.55.0
+
+
+From ddfd109eb045ed5f98bd5e31e293f328e38e1bed Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Sat, 26 Sep 2026 19:25:00 +0200
+Subject: [PATCH 5/5] fix: wait for pending power commands before releasing the
+ stations on exit
+
+When SteamVR stops, the sleep commands go out and the app quits right
+away. disconnectAllBaseStations used to drop the links immediately, so a
+write-only station got a single sleep command - exactly the case that
+stations on old firmware sometimes ignore. Wait (up to 16 s) until every
+station has confirmed or finished re-sending its last command.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app.go | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/app.go b/app.go
+index dbf9cd2..5deac03 100644
+--- a/app.go
++++ b/app.go
+@@ -126,6 +126,25 @@ func (a *App) startup(ctx context.Context) {
+ // the connection at the daemon level, so it survives the process exiting and
+ // the station stays claimed until something explicitly disconnects it.
+ func disconnectAllBaseStations() {
++	// A sleep command sent right before exit is still being re-sent to the
++	// write-only stations; disconnecting now would leave them with a single
++	// attempt, which they sometimes ignore. Give the confirmation loops time
++	// to finish first.
++	deadline := time.Now().Add(16 * time.Second)
++	for time.Now().Before(deadline) {
++		pending := false
++		for _, bs := range knownBaseStations.Items() {
++			if bs != nil && (*bs).PowerCommandPending() {
++				pending = true
++				break
++			}
++		}
++		if !pending {
++			break
++		}
++		time.Sleep(250 * time.Millisecond)
++	}
++
+ 	for name, bs := range knownBaseStations.Items() {
+ 		if bs == nil {
+ 			continue
+-- 
+2.55.0
+

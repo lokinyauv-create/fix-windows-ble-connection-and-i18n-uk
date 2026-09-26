@@ -18,6 +18,10 @@ export function CreateGroup(arg1, arg2) {
   return window['go']['main']['App']['CreateGroup'](arg1, arg2);
 }
 
+export function EnableBluetooth() {
+  return window['go']['main']['App']['EnableBluetooth']();
+}
+
 export function ForceUpdate() {
   return window['go']['main']['App']['ForceUpdate']();
 }
@@ -36,6 +40,10 @@ export function GetFoundBaseStations() {
 
 export function GetVersion() {
   return window['go']['main']['App']['GetVersion']();
+}
+
+export function HideToTray() {
+  return window['go']['main']['App']['HideToTray']();
 }
 
 export function IdentitifyBaseStation(arg1) {
@@ -62,12 +70,20 @@ export function Notify(arg1, arg2) {
   return window['go']['main']['App']['Notify'](arg1, arg2);
 }
 
+export function ReconnectBaseStations() {
+  return window['go']['main']['App']['ReconnectBaseStations']();
+}
+
 export function RemoveGroup(arg1) {
   return window['go']['main']['App']['RemoveGroup'](arg1);
 }
 
 export function RenameGroup(arg1, arg2) {
   return window['go']['main']['App']['RenameGroup'](arg1, arg2);
+}
+
+export function ShowFromTray() {
+  return window['go']['main']['App']['ShowFromTray']();
 }
 
 export function Shutdown() {

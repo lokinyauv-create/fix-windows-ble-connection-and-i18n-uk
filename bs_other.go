@@ -5,12 +5,17 @@ package main
 
 import (
 	"log"
+	"strings"
 	"time"
 
 	"tinygo.org/x/bluetooth"
 )
 
 func connectToPreloadedBaseStation(bs *LighthouseV2, config BaseStationConfiguration, wakeUp bool, attemp int) {
+	if attemp > 5 {
+		log.Printf("Giving up connecting to base station %s after %d attempts\n", config.Id, attemp)
+		return
+	}
 
 	parsedMac, err := bluetooth.ParseMAC(config.MacAddress)
 
@@ -19,22 +24,51 @@ func connectToPreloadedBaseStation(bs *LighthouseV2, config BaseStationConfigura
 		return
 	}
 
-	conn, err := adapter.Connect(bluetooth.Address{
-		MACAddress: bluetooth.MACAddress{
-			MAC: parsedMac,
-		},
-	}, bluetooth.ConnectionParams{})
-	if err != nil {
-		log.Printf("Failed to connect to base station: %s %+v", config.Id, err)
+	// adapter.Connect blocks on a BlueZ D-Bus PropertiesChanged signal with no
+	// built-in timeout, so a base station that never answers (or a stale/
+	// unregistered BlueZ device object) hangs this goroutine forever with no
+	// further retries. Bound it so we always fall back to a retry.
+	type connectResult struct {
+		conn bluetooth.Device
+		err  error
+	}
+	connectDone := make(chan connectResult, 1)
+	go func() {
+		conn, err := adapter.Connect(bluetooth.Address{
+			MACAddress: bluetooth.MACAddress{
+				MAC: parsedMac,
+			},
+		}, bluetooth.ConnectionParams{})
+		connectDone <- connectResult{conn, err}
+	}()
 
+	var conn bluetooth.Device
+	select {
+	case res := <-connectDone:
+		if res.err != nil {
+			log.Printf("Failed to connect to base station: %s %+v", config.Id, res.err)
+
+			if strings.Contains(res.err.Error(), "not found") || strings.Contains(res.err.Error(), "doesn't exist") {
+				// BlueZ only exposes a D-Bus object for devices it has seen, so
+				// connecting by address to a station it hasn't observed fails
+				// until a scan registers it.
+				discoverBaseStation(config.MacAddress, 8*time.Second)
+			} else {
+				time.Sleep(time.Second)
+			}
+
+			connectToPreloadedBaseStation(bs, config, wakeUp, attemp+1)
+			return
+		}
+		conn = res.conn
+	case <-time.After(10 * time.Second):
+		log.Printf("Timed out connecting to base station %s after 10s, retrying (attempt %d)...\n", config.Id, attemp+1)
 		time.Sleep(time.Second)
 		connectToPreloadedBaseStation(bs, config, wakeUp, attemp+1)
 		return
 	}
 
 	bs.adapter = adapter
-
-	defer conn.Disconnect()
 
 	bs.p = &conn
 
@@ -43,14 +77,27 @@ func connectToPreloadedBaseStation(bs *LighthouseV2, config BaseStationConfigura
 	bs.FindService()
 	bs.ScanCharacteristics()
 
+	// Finish setting up notifications before the wake command goes out: the
+	// station acks a write that races with that setup and then ignores it.
+	bs.StartCaching()
+
 	if wakeUp {
 		bs.SetPowerState(byte(0x01))
 	}
-
-	go bs.StartCaching()
 }
 
 func (lv *LighthouseV2) StartCaching() {
+	lv.gattMu.Lock()
+	defer lv.gattMu.Unlock()
+
+	// ScanCharacteristics, InitStack and the connect path all ask for this;
+	// enabling notifications twice on the same characteristic only fails
+	// ("unclosed notifications") and gets in the way of power writes.
+	if lv.powerStateCharacteristic == nil || lv.cachingFor == lv.powerStateCharacteristic {
+		return
+	}
+	lv.cachingFor = lv.powerStateCharacteristic
+
 	if lv.powerStateCharacteristic != nil {
 
 		err := lv.powerStateCharacteristic.EnableNotifications(func(buf []byte) {
@@ -62,6 +109,8 @@ func (lv *LighthouseV2) StartCaching() {
 		if err != nil {
 			log.Printf("Failed to receive notifications on power state, base station firmware probably outdated; lighthouse=%s; err=%+v", lv.Id, err)
 			lv.updateAvailable = true
+		} else {
+			lv.powerFeedback = true
 		}
 	}
 
@@ -80,6 +129,12 @@ func (lv *LighthouseV2) StartCaching() {
 }
 
 func (lighthouse *LighthouseV2) Write(characteristic *bluetooth.DeviceCharacteristic, value []byte) (int, error) {
+	lighthouse.gattMu.Lock()
+	defer lighthouse.gattMu.Unlock()
+
+	// Despite the name this is a plain WriteValue without a "type" option, so
+	// BlueZ uses a write request whenever the characteristic supports one and
+	// the call only returns once the station has acknowledged it.
 	bytes, err := characteristic.WriteWithoutResponse(value)
 	return bytes, err
 }
@@ -91,6 +146,8 @@ func (lv *LighthouseV2) Reconnect() {
 	lv.identifyCharacteristic = nil
 	lv.modeCharacteristic = nil
 	lv.powerStateCharacteristic = nil
+	lv.cachingFor = nil
+	lv.powerFeedback = false
 
 	log.Println("Reconnecting...")
 	parsedMac, err := bluetooth.ParseMAC(lv.mac)

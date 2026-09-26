@@ -1,0 +1,712 @@
+From fd23713f1f66a7dca4e23291fb2f6cf2cb32d10a Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Mon, 3 Aug 2026 02:29:57 +0200
+Subject: [PATCH 1/6] fix(windows): stop scanning while preloading known base
+ stations
+
+Starting the 10s advertisement scan at startup (InitBluetooth) made
+the radio scan concurrently while preloadBaseStations was enumerating
+GATT services on already-known stations. On Windows this made service
+discovery hang indefinitely, leaving devices stuck on "Connecting..."
+forever.
+
+Split adapter bring-up (EnableBluetooth) from starting a scan, and
+only enable the adapter at startup. Scanning for new devices is still
+available on demand via StartScanFor10Seconds.
+
+(cherry picked from commit 5ddb437d30ab4c7c78d7f0fd34eaca5a5cffbebe)
+---
+ app.go                            | 18 ++++++++++++++----
+ frontend/wailsjs/go/main/App.d.ts |  2 ++
+ frontend/wailsjs/go/main/App.js   |  4 ++++
+ 3 files changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/app.go b/app.go
+index 8aa0d8b..301b948 100644
+--- a/app.go
++++ b/app.go
+@@ -84,7 +84,13 @@ func (a *App) startup(ctx context.Context) {
+ 	}()
+ 
+ 	config = GetConfiguration()
+-	a.InitBluetooth()
++
++	// Only bring the adapter up here. Starting an advertisement scan at this
++	// point (as InitBluetooth does) makes the radio scan while
++	// preloadBaseStations is enumerating GATT services on the known base
++	// stations, and on Windows that makes service discovery hang forever.
++	// Scanning is started on demand instead - see StartScanFor10Seconds.
++	a.EnableBluetooth()
+ 
+ 	go a.preloadBaseStations()
+ 
+@@ -337,22 +343,26 @@ func (a *App) StartScanFor10Seconds() {
+ 	}))
+ }
+ 
+-func (a *App) InitBluetooth() bool {
++// EnableBluetooth brings up the adapter without starting a scan.
++func (a *App) EnableBluetooth() bool {
+ 
+ 	if a.bluetoothInitFinished {
+ 		return true
+ 	}
+ 
+ 	if err := adapter.Enable(); err != nil {
++		log.Printf("Failed to enable bluetooth adapter: %+v\n", err)
+ 		return false
+ 	}
+ 
+-	go a.StartScanFor10Seconds()
+-
+ 	a.bluetoothInitFinished = true
+ 	return true
+ }
+ 
++func (a *App) InitBluetooth() bool {
++	return a.EnableBluetooth()
++}
++
+ func ScanCallback(app *App, a *bluetooth.Adapter, sr bluetooth.ScanResult) {
+ 
+ 	_, found := knownBaseStations.Get(sr.LocalName())
+diff --git a/frontend/wailsjs/go/main/App.d.ts b/frontend/wailsjs/go/main/App.d.ts
+index 3b5ae7a..5b59667 100755
+--- a/frontend/wailsjs/go/main/App.d.ts
++++ b/frontend/wailsjs/go/main/App.d.ts
+@@ -10,6 +10,8 @@ export function ChangeBaseStationPowerStatus(arg1:string,arg2:string):Promise<st
+ 
+ export function CreateGroup(arg1:string,arg2:Array<string>):Promise<string>;
+ 
++export function EnableBluetooth():Promise<boolean>;
++
+ export function ForceUpdate():Promise<void>;
+ 
+ export function ForgetBaseStation(arg1:string):Promise<void>;
+diff --git a/frontend/wailsjs/go/main/App.js b/frontend/wailsjs/go/main/App.js
+index bf0a24a..3f8adec 100755
+--- a/frontend/wailsjs/go/main/App.js
++++ b/frontend/wailsjs/go/main/App.js
+@@ -18,6 +18,10 @@ export function CreateGroup(arg1, arg2) {
+   return window['go']['main']['App']['CreateGroup'](arg1, arg2);
+ }
+ 
++export function EnableBluetooth() {
++  return window['go']['main']['App']['EnableBluetooth']();
++}
++
+ export function ForceUpdate() {
+   return window['go']['main']['App']['ForceUpdate']();
+ }
+-- 
+2.55.0
+
+
+From 07377a6a4f38858b265150347115794aabe9df4d Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Mon, 3 Aug 2026 02:30:07 +0200
+Subject: [PATCH 2/6] fix(windows): bound GATT service discovery with a timeout
+ and retry
+
+Two issues in connectToPreloadedBaseStation on Windows:
+
+- `defer conn.Disconnect()` tore the connection down the moment the
+  function returned, i.e. right after it was established - base
+  stations would connect and immediately disconnect again.
+- GetGattServicesWithCacheModeAsync has no built-in timeout on
+  Windows. If a base station doesn't answer the over-the-air service
+  enumeration request, the call hangs forever with no way to recover.
+- FindService()/ScanCharacteristics() call Reconnect() on every
+  failure, which turns one unresponsive station into a storm of
+  overlapping reconnect attempts.
+
+Discover the service inline, bound it with an 8s timeout, and retry
+the whole connection (capped at 5 attempts) instead of hanging or
+reconnecting from within discovery.
+
+(cherry picked from commit 628ffd6d82da68c3f752073a45998855446b6a96)
+---
+ bs_windows.go | 63 +++++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 58 insertions(+), 5 deletions(-)
+
+diff --git a/bs_windows.go b/bs_windows.go
+index c3af634..2e739d4 100644
+--- a/bs_windows.go
++++ b/bs_windows.go
+@@ -5,6 +5,7 @@ package main
+ 
+ import (
+ 	"log"
++	"strings"
+ 	"time"
+ 
+ 	"tinygo.org/x/bluetooth"
+@@ -79,6 +80,10 @@ func (lv *LighthouseV2) StartCaching() {
+ }
+ 
+ func connectToPreloadedBaseStation(bs *LighthouseV2, config BaseStationConfiguration, wakeUp bool, attemp int) {
++	if attemp > 5 {
++		log.Printf("Giving up connecting to base station %s after %d attempts\n", config.Id, attemp)
++		return
++	}
+ 
+ 	parsedMac, err := bluetooth.ParseMAC(config.MacAddress)
+ 
+@@ -102,14 +107,62 @@ func connectToPreloadedBaseStation(bs *LighthouseV2, config BaseStationConfigura
+ 
+ 	bs.adapter = adapter
+ 
+-	defer conn.Disconnect()
+-
+ 	bs.p = &conn
++	bs.mac = config.MacAddress
++
++	log.Printf("Connected to base station: %s, wake up: %+v; discovering GATT services...\n", config.Id, wakeUp)
++
++	// Discover the service inline instead of going through FindService, which
++	// kicks off a Reconnect() on every failure and turns a single unresponsive
++	// station into a storm of overlapping connection attempts.
++	// GetGattServicesWithCacheModeAsync also has no built-in timeout on Windows
++	// and hangs indefinitely if the device never answers, so bound it here.
++	discoveryDone := make(chan bool, 1)
++	go func() {
++		services, err := conn.DiscoverServices(nil)
++		if err != nil {
++			log.Printf("Failed to discover services on %s: %+v\n", config.Id, err)
++			discoveryDone <- false
++			return
++		}
+ 
+-	log.Printf("Connected to base station: %s, wake up: %+v\n", config.Id, wakeUp)
++		var foundService *bluetooth.DeviceService
++		for i := range services {
++			service := &services[i]
++			if strings.ToUpper(service.UUID().String()) == LIGHTHOUSE_SERVICE_UUID {
++				log.Printf("Found lighthouse service on base station %s\n", config.Id)
++				foundService = service
++				break
++			}
++		}
+ 
+-	bs.FindService()
+-	bs.ScanCharacteristics()
++		if foundService == nil {
++			log.Printf("Lighthouse service not found on base station %s\n", config.Id)
++			discoveryDone <- false
++			return
++		}
++
++		bs.service = foundService
++		discoveryDone <- bs.ScanCharacteristics()
++	}()
++
++	select {
++	case ok := <-discoveryDone:
++		if !ok {
++			log.Printf("Discovery failed on %s, retrying (attempt %d)...\n", config.Id, attemp+1)
++			conn.Disconnect()
++			time.Sleep(time.Second)
++			connectToPreloadedBaseStation(bs, config, wakeUp, attemp+1)
++			return
++		}
++		log.Printf("Finished discovering GATT services/characteristics on %s\n", config.Id)
++	case <-time.After(8 * time.Second):
++		log.Printf("Timed out discovering GATT services on %s after 8s, disconnecting and retrying (attempt %d)...\n", config.Id, attemp+1)
++		conn.Disconnect()
++		time.Sleep(time.Second)
++		connectToPreloadedBaseStation(bs, config, wakeUp, attemp+1)
++		return
++	}
+ 
+ 	if wakeUp {
+ 		bs.SetPowerState(byte(0x01))
+-- 
+2.55.0
+
+
+From d1cb3534a9dcb21af1374523228554cc6021b71d Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Mon, 3 Aug 2026 02:30:12 +0200
+Subject: [PATCH 3/6] fix(linux): don't disconnect from base station right
+ after connecting
+
+Same issue as the Windows connect path: deferring Disconnect() here
+tore the connection down as soon as the function returned, which is
+immediately after it succeeded.
+
+(cherry picked from commit 40f54daea67b76e4f63f1043e5c2ac6732cccb4e)
+---
+ bs_other.go | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/bs_other.go b/bs_other.go
+index 439b2a3..ec7a484 100644
+--- a/bs_other.go
++++ b/bs_other.go
+@@ -34,8 +34,6 @@ func connectToPreloadedBaseStation(bs *LighthouseV2, config BaseStationConfigura
+ 
+ 	bs.adapter = adapter
+ 
+-	defer conn.Disconnect()
+-
+ 	bs.p = &conn
+ 
+ 	log.Printf("Connected to base station: %s, wake up: %+v\n", config.Id, wakeUp)
+-- 
+2.55.0
+
+
+From 4bb41a39043f24a647fbba1ed00117d4bc57a7bb Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Tue, 4 Aug 2026 02:10:55 +0200
+Subject: [PATCH 4/6] fix: cap connection retries and bound adapter.Connect
+ with a timeout on both platforms
+
+Found via a live dual-OS test: Windows and the Linux build were pointed
+at the same two base stations simultaneously, then Windows was shut
+down to free one up. The already-running Linux process never picked
+it back up - it was still spinning in connectToPreloadedBaseStation's
+retry loop, which (unlike the Windows path) had no attempt cap. It
+was retrying once a second, forever.
+
+Both platforms also block on adapter.Connect() with no timeout at
+all - on Linux this waits on a BlueZ D-Bus PropertiesChanged signal
+that may never arrive (e.g. a stale/unregistered device object); on
+Windows it waits on the equivalent WinRT async call. Either can hang
+a connection attempt forever with no log output and no retry, which
+is worse than a fast failure since it never even reaches the
+GATT-discovery timeout added earlier.
+
+Bound adapter.Connect with the same 10s-timeout-then-retry pattern
+already used for GATT discovery on Windows, and gave the Linux path
+the same 5-attempt cap Windows already had.
+
+Verified live against the real base stations on both machines after
+this change: normal connects still succeed immediately on both
+platforms, and the new cap was directly observed working on Linux
+("Giving up connecting ... after 6 attempts" instead of retrying
+forever).
+
+(cherry picked from commit 587dfe9f5b1a1e06c1a27256777b4bdbe493a4f1)
+---
+ bs_other.go   | 43 +++++++++++++++++++++++++++++++++++--------
+ bs_windows.go | 36 +++++++++++++++++++++++++++++-------
+ 2 files changed, 64 insertions(+), 15 deletions(-)
+
+diff --git a/bs_other.go b/bs_other.go
+index ec7a484..64c627f 100644
+--- a/bs_other.go
++++ b/bs_other.go
+@@ -11,6 +11,10 @@ import (
+ )
+ 
+ func connectToPreloadedBaseStation(bs *LighthouseV2, config BaseStationConfiguration, wakeUp bool, attemp int) {
++	if attemp > 5 {
++		log.Printf("Giving up connecting to base station %s after %d attempts\n", config.Id, attemp)
++		return
++	}
+ 
+ 	parsedMac, err := bluetooth.ParseMAC(config.MacAddress)
+ 
+@@ -19,14 +23,37 @@ func connectToPreloadedBaseStation(bs *LighthouseV2, config BaseStationConfigura
+ 		return
+ 	}
+ 
+-	conn, err := adapter.Connect(bluetooth.Address{
+-		MACAddress: bluetooth.MACAddress{
+-			MAC: parsedMac,
+-		},
+-	}, bluetooth.ConnectionParams{})
+-	if err != nil {
+-		log.Printf("Failed to connect to base station: %s %+v", config.Id, err)
+-
++	// adapter.Connect blocks on a BlueZ D-Bus PropertiesChanged signal with no
++	// built-in timeout, so a base station that never answers (or a stale/
++	// unregistered BlueZ device object) hangs this goroutine forever with no
++	// further retries. Bound it so we always fall back to a retry.
++	type connectResult struct {
++		conn bluetooth.Device
++		err  error
++	}
++	connectDone := make(chan connectResult, 1)
++	go func() {
++		conn, err := adapter.Connect(bluetooth.Address{
++			MACAddress: bluetooth.MACAddress{
++				MAC: parsedMac,
++			},
++		}, bluetooth.ConnectionParams{})
++		connectDone <- connectResult{conn, err}
++	}()
++
++	var conn bluetooth.Device
++	select {
++	case res := <-connectDone:
++		if res.err != nil {
++			log.Printf("Failed to connect to base station: %s %+v", config.Id, res.err)
++
++			time.Sleep(time.Second)
++			connectToPreloadedBaseStation(bs, config, wakeUp, attemp+1)
++			return
++		}
++		conn = res.conn
++	case <-time.After(10 * time.Second):
++		log.Printf("Timed out connecting to base station %s after 10s, retrying (attempt %d)...\n", config.Id, attemp+1)
+ 		time.Sleep(time.Second)
+ 		connectToPreloadedBaseStation(bs, config, wakeUp, attemp+1)
+ 		return
+diff --git a/bs_windows.go b/bs_windows.go
+index 2e739d4..00b3936 100644
+--- a/bs_windows.go
++++ b/bs_windows.go
+@@ -92,14 +92,36 @@ func connectToPreloadedBaseStation(bs *LighthouseV2, config BaseStationConfigura
+ 		return
+ 	}
+ 
+-	conn, err := adapter.Connect(bluetooth.Address{
+-		MACAddress: bluetooth.MACAddress{
+-			MAC: parsedMac,
+-		},
+-	}, bluetooth.ConnectionParams{})
+-	if err != nil {
+-		log.Printf("Failed to connect to base station: %s %+v", config.Id, err)
++	// adapter.Connect has no built-in timeout on Windows either, so a base
++	// station that never answers the WinRT connect request would otherwise
++	// hang this goroutine forever with no further retries.
++	type connectResult struct {
++		conn bluetooth.Device
++		err  error
++	}
++	connectDone := make(chan connectResult, 1)
++	go func() {
++		conn, err := adapter.Connect(bluetooth.Address{
++			MACAddress: bluetooth.MACAddress{
++				MAC: parsedMac,
++			},
++		}, bluetooth.ConnectionParams{})
++		connectDone <- connectResult{conn, err}
++	}()
++
++	var conn bluetooth.Device
++	select {
++	case res := <-connectDone:
++		if res.err != nil {
++			log.Printf("Failed to connect to base station: %s %+v", config.Id, res.err)
+ 
++			time.Sleep(time.Second)
++			connectToPreloadedBaseStation(bs, config, wakeUp, attemp+1)
++			return
++		}
++		conn = res.conn
++	case <-time.After(10 * time.Second):
++		log.Printf("Timed out connecting to base station %s after 10s, retrying (attempt %d)...\n", config.Id, attemp+1)
+ 		time.Sleep(time.Second)
+ 		connectToPreloadedBaseStation(bs, config, wakeUp, attemp+1)
+ 		return
+-- 
+2.55.0
+
+
+From d63713108b08b88c51ba215d4232fe5c28c5d799 Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Thu, 6 Aug 2026 22:14:13 +0200
+Subject: [PATCH 5/6] fix: stop racing two connection attempts against the same
+ base station
+
+A power command that arrived while the startup preload was still
+connecting found the station not yet "ready", so it called
+ReconnectBaseStations, which ran a whole second preload pass. Both
+passes then connected to the same station, and since a station accepts
+one link at a time the two chains fought: one got the characteristics,
+the other got an empty list and logged "Mode: false, Power: false, ID:
+false", tore the connection down and retried, until both gave up.
+
+The SteamVR automation triggers exactly this, because it fires a wake
+command the moment a session starts - which is also when the app is
+launched and still connecting. So the automation reliably broke the
+connections it was waiting on, and the stations sat on "Connecting..."
+forever.
+
+Track the stations with an attempt in flight and skip them in
+preloadBaseStations, along with any that are already connected.
+Verified: one preload per station now, and a station that used to
+churn through six failed attempts connects on the first.
+
+Also fix the logging, without which none of this was visible. It was
+skipped entirely for DEBUG builds, and in release builds the file
+handle was closed as soon as startup returned - so log.txt only ever
+held the first few lines. Neither leaves anything to read when SteamVR
+auto-launches the app and there is no console. Keep the file open for
+the process lifetime and write to both it and stdout, with the file
+first: MultiWriter stops at the first writer that errors, and a GUI
+process launched without a console has no usable stdout, which
+swallowed the whole log.
+
+(cherry picked from commit 5988270363900cbfc9db49b025e0b570db6f2d53)
+---
+ app.go | 39 +++++++++++++++++++++++++++++++--------
+ bs.go  | 19 ++++++++++++++++++-
+ 2 files changed, 49 insertions(+), 9 deletions(-)
+
+diff --git a/app.go b/app.go
+index 301b948..03b18a4 100644
+--- a/app.go
++++ b/app.go
+@@ -2,6 +2,7 @@ package main
+ 
+ import (
+ 	"context"
++	"io"
+ 	"log"
+ 	"os"
+ 	"path"
+@@ -53,14 +54,19 @@ func (a *App) UpdateConfigValue(name string, value interface{}) {
+ }
+ func (a *App) startup(ctx context.Context) {
+ 
+-	if !strings.Contains(VERSION_FLAGS, "DEBUG") {
+-		f, err := os.OpenFile(path.Join(GetConfigFolder(), "log.txt"), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+-		if err != nil {
+-			log.Fatalf("error opening file: %v", err)
+-		}
+-		defer f.Close()
+-
+-		log.SetOutput(f)
++	// Always keep a log file, and deliberately never close it. This used to be
++	// skipped entirely for DEBUG builds and, worse, the handle was closed as
++	// soon as startup returned - so log.txt only ever held the first few lines
++	// and a problem that showed up later left no trace at all. That matters
++	// most when SteamVR auto-launches us, because then there is no console to
++	// read either.
++	if f, err := os.OpenFile(path.Join(GetConfigFolder(), "log.txt"), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666); err != nil {
++		log.Printf("Failed to open log file, logging to stdout only: %v\n", err)
++	} else {
++		// File first: MultiWriter stops at the first writer that errors, and a
++		// GUI process launched without a console (SteamVR does exactly that)
++		// has no usable stdout - putting it first swallowed the whole log.
++		log.SetOutput(io.MultiWriter(f, os.Stdout))
+ 	}
+ 
+ 	log.Printf("Version flags: %s\n", VERSION_FLAGS)
+@@ -206,6 +212,20 @@ func (a *App) preloadBaseStations() {
+ 
+ 	steamVrRunning, _ := isProcRunning("vrserver.exe")
+ 	for name, baseStation := range config.KnownBaseStations {
++		// Don't start a second attempt on a station that is already connected
++		// or already being connected to. A power command arriving while the
++		// startup pass is still running used to trigger a whole second pass
++		// through ReconnectBaseStations, and the two chains then fought over
++		// the station's single BLE link: one got the characteristics, the other
++		// got an empty list, and both churned until they gave up.
++		if existing, ok := knownBaseStations.Get(name); ok && existing != nil && (*existing).GetStatus() == "ready" {
++			continue
++		}
++
++		if BaseStationIsConnecting(baseStation.Id) {
++			continue
++		}
++
+ 		log.Printf("Preload base station: %s %+v\n", name, baseStation)
+ 		preloadedBaseStation := PreloadBaseStation(*baseStation, steamVrRunning && ((baseStation.ManagedFlags&2) > 0))
+ 		knownBaseStations.Set(name, &preloadedBaseStation)
+@@ -414,9 +434,12 @@ func ScanCallback(app *App, a *bluetooth.Adapter, sr bluetooth.ScanResult) {
+ }
+ 
+ func (a *App) ChangeBaseStationPowerStatus(baseStationMac string, status string) string {
++	log.Printf("Power command requested: %s -> %s\n", baseStationMac, status)
++
+ 	baseStation, found := knownBaseStations.Get(baseStationMac)
+ 
+ 	if !found {
++		log.Printf("Power command failed, %s is not a known base station\n", baseStationMac)
+ 		return "Unknown base station"
+ 	}
+ 
+diff --git a/bs.go b/bs.go
+index 2efe509..3c19e9a 100644
+--- a/bs.go
++++ b/bs.go
+@@ -3,6 +3,7 @@ package main
+ import (
+ 	"log"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	"tinygo.org/x/bluetooth"
+@@ -57,6 +58,18 @@ type LighthouseV2 struct {
+ 	updateAvailable          bool
+ }
+ 
++// connectingBaseStations holds the ids of the stations with a connection
++// attempt currently in flight, so a second pass can tell the difference between
++// "not connected yet" and "nobody is working on it". A base station accepts one
++// connection at a time, so two chains racing on the same one make GATT
++// discovery come back empty for both.
++var connectingBaseStations sync.Map
++
++func BaseStationIsConnecting(id string) bool {
++	_, connecting := connectingBaseStations.Load(id)
++	return connecting
++}
++
+ func PreloadBaseStation(config BaseStationConfiguration, wakeUp bool) BaseStation {
+ 	lh := &LighthouseV2{
+ 		Name:             config.Name,
+@@ -67,7 +80,11 @@ func PreloadBaseStation(config BaseStationConfiguration, wakeUp bool) BaseStatio
+ 		ValidLighthouse:  false,
+ 	}
+ 
+-	go connectToPreloadedBaseStation(lh, config, wakeUp, 0)
++	connectingBaseStations.Store(config.Id, struct{}{})
++	go func() {
++		defer connectingBaseStations.Delete(config.Id)
++		connectToPreloadedBaseStation(lh, config, wakeUp, 0)
++	}()
+ 
+ 	return lh
+ }
+-- 
+2.55.0
+
+
+From 75cd30ffd4537036319bf43b7e7aeda0809b8741 Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Thu, 6 Aug 2026 22:24:49 +0200
+Subject: [PATCH 6/6] fix: scan for a base station the adapter can no longer
+ resolve
+
+Connecting by address fails outright if the adapter hasn't observed
+the device recently - Windows reports "device with the given address
+was not found", BlueZ has no D-Bus object to talk to - and a station
+that has simply been idle for a while falls into that state while
+sitting there powered on and advertising perfectly well.
+
+Confirmed with a standalone probe against a station the app had given
+up on: connecting cold failed, an 8s scan saw it immediately at
+rssi -36, and connecting straight afterwards succeeded and enumerated
+all six services.
+
+So on a "not found" failure, scan until the address turns up and then
+retry. The scan stops the moment the station is seen and holds a mutex
+so two never overlap, because scanning on top of another station's
+service discovery is what made discovery hang in the first place.
+
+Verified end to end: a station that previously exhausted all six
+attempts with "device with the given address was not found" now
+connects on the first, and both stations get their automatic wake.
+
+(cherry picked from commit 74a3d459e7844e9870f015c7740a3a423f21d6b7)
+---
+ bs.go         | 44 ++++++++++++++++++++++++++++++++++++++++++++
+ bs_other.go   | 11 ++++++++++-
+ bs_windows.go | 10 +++++++++-
+ 3 files changed, 63 insertions(+), 2 deletions(-)
+
+diff --git a/bs.go b/bs.go
+index 3c19e9a..9b284c5 100644
+--- a/bs.go
++++ b/bs.go
+@@ -70,6 +70,50 @@ func BaseStationIsConnecting(id string) bool {
+ 	return connecting
+ }
+ 
++// scanMutex keeps discovery passes from overlapping each other. Scanning while
++// another station is enumerating its GATT services is what made discovery hang
++// on Windows, so a scan is kept as short as it can be and never runs twice at
++// once.
++var scanMutex sync.Mutex
++
++// discoverBaseStation scans until the given address shows up, so the OS can
++// resolve it. Both backends refuse to connect by address to a device they
++// haven't observed recently - Windows fails outright with "device with the
++// given address was not found", BlueZ with a missing D-Bus object - and a
++// station that was simply idle long enough falls into that state even though
++// it is powered on and advertising normally.
++func discoverBaseStation(mac string, timeout time.Duration) bool {
++	scanMutex.Lock()
++	defer scanMutex.Unlock()
++
++	log.Printf("Scanning so the adapter can resolve %s...\n", mac)
++
++	found := make(chan struct{})
++	var once sync.Once
++
++	go adapter.Scan(func(a *bluetooth.Adapter, sr bluetooth.ScanResult) {
++		if strings.EqualFold(sr.Address.String(), mac) {
++			once.Do(func() { close(found) })
++		}
++	})
++
++	seen := false
++	select {
++	case <-found:
++		seen = true
++	case <-time.After(timeout):
++	}
++
++	adapter.StopScan()
++
++	// Let the radio settle before the connect attempt - overlapping the two is
++	// exactly what breaks service discovery.
++	time.Sleep(500 * time.Millisecond)
++
++	log.Printf("Scan for %s finished, found: %v\n", mac, seen)
++	return seen
++}
++
+ func PreloadBaseStation(config BaseStationConfiguration, wakeUp bool) BaseStation {
+ 	lh := &LighthouseV2{
+ 		Name:             config.Name,
+diff --git a/bs_other.go b/bs_other.go
+index 64c627f..aa8401b 100644
+--- a/bs_other.go
++++ b/bs_other.go
+@@ -5,6 +5,7 @@ package main
+ 
+ import (
+ 	"log"
++	"strings"
+ 	"time"
+ 
+ 	"tinygo.org/x/bluetooth"
+@@ -47,7 +48,15 @@ func connectToPreloadedBaseStation(bs *LighthouseV2, config BaseStationConfigura
+ 		if res.err != nil {
+ 			log.Printf("Failed to connect to base station: %s %+v", config.Id, res.err)
+ 
+-			time.Sleep(time.Second)
++			if strings.Contains(res.err.Error(), "not found") || strings.Contains(res.err.Error(), "doesn't exist") {
++				// BlueZ only exposes a D-Bus object for devices it has seen, so
++				// connecting by address to a station it hasn't observed fails
++				// until a scan registers it.
++				discoverBaseStation(config.MacAddress, 8*time.Second)
++			} else {
++				time.Sleep(time.Second)
++			}
++
+ 			connectToPreloadedBaseStation(bs, config, wakeUp, attemp+1)
+ 			return
+ 		}
+diff --git a/bs_windows.go b/bs_windows.go
+index 00b3936..bebbf07 100644
+--- a/bs_windows.go
++++ b/bs_windows.go
+@@ -115,7 +115,15 @@ func connectToPreloadedBaseStation(bs *LighthouseV2, config BaseStationConfigura
+ 		if res.err != nil {
+ 			log.Printf("Failed to connect to base station: %s %+v", config.Id, res.err)
+ 
+-			time.Sleep(time.Second)
++			if strings.Contains(res.err.Error(), "not found") {
++				// Windows won't connect by address to a device it hasn't seen
++				// recently, even one sitting right there advertising. A scan
++				// makes it resolvable again.
++				discoverBaseStation(config.MacAddress, 8*time.Second)
++			} else {
++				time.Sleep(time.Second)
++			}
++
+ 			connectToPreloadedBaseStation(bs, config, wakeUp, attemp+1)
+ 			return
+ 		}
+-- 
+2.55.0
+
