@@ -43,7 +43,7 @@ func StartHttp() {
 
 func waitForSteamVR() {
 	go func() {
-		if runtime.GOOS == "windows" {
+		if runtime.GOOS == "windows" || runtime.GOOS == "linux" {
 
 			log.Println("Started waiting for steamvr")
 

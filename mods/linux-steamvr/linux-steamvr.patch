@@ -1,0 +1,279 @@
+From 130a7e21a8ea0e6e8674e5abbf295bb557956b98 Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Wed, 23 Sep 2026 02:30:14 +0200
+Subject: [PATCH 1/3] feat(linux): register with SteamVR and detect running
+ processes on Linux
+
+- steamConfigDir() per platform (steam_{linux,windows,darwin}.go) instead of
+  the hard-coded "${ProgramFiles(x86)}\Steam\config", so AddToStartup /
+  RemoveFromStartup / GetSteamVRInstalled work with a native Linux Steam
+- binary_path_linux / binary_path_osx in the vrmanifest, so SteamVR can
+  auto-launch the app outside Windows
+- a real isProcRunning() for non-Windows that scans /proc (it always
+  returned false); Windows-style "vrserver.exe" names are accepted
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ config.go                   |  8 ++++----
+ process_other.go            | 34 ++++++++++++++++++++++++++++++++++
+ steam_darwin.go             | 18 ++++++++++++++++++
+ steam_linux.go              | 20 ++++++++++++++++++++
+ steam_windows.go            | 11 +++++++++++
+ steamvr/manifest.vrmanifest |  2 ++
+ 6 files changed, 89 insertions(+), 4 deletions(-)
+ create mode 100644 steam_darwin.go
+ create mode 100644 steam_linux.go
+ create mode 100644 steam_windows.go
+
+diff --git a/config.go b/config.go
+index 626d615..1960ce5 100644
+--- a/config.go
++++ b/config.go
+@@ -269,7 +269,7 @@ func AddToStartup() {
+ 
+ 	//Appending it to appconfig.json
+ 
+-	fp := os.ExpandEnv("${ProgramFiles(x86)}\\Steam\\config\\appconfig.json")
++	fp := path.Join(steamConfigDir(), "appconfig.json")
+ 
+ 	fileBytes, err := os.ReadFile(fp)
+ 
+@@ -301,13 +301,13 @@ func AddToStartup() {
+ 		panic("Failed to write new appconfig.")
+ 	}
+ 
+-	fp = os.ExpandEnv("${ProgramFiles(x86)}\\Steam\\config\\vrappconfig")
++	fp = path.Join(steamConfigDir(), "vrappconfig")
+ 
+ 	_ = os.WriteFile(path.Join(fp, "com.github.dhcpcd9.base-station-manager.vrappconfig"), []byte(vrappconfig), 0644)
+ }
+ 
+ func RemoveFromStartup() {
+-	fp := os.ExpandEnv("${ProgramFiles(x86)}\\Steam\\config\\vrappconfig\\com.github.dhcpcd9.base-station-manager.vrappconfig")
++	fp := path.Join(steamConfigDir(), "vrappconfig", "com.github.dhcpcd9.base-station-manager.vrappconfig")
+ 
+ 	if err := os.Remove(fp); err != nil {
+ 		log.Println("Failed to write config.")
+@@ -315,7 +315,7 @@ func RemoveFromStartup() {
+ }
+ 
+ func GetSteamVRInstalled() bool {
+-	fp := os.ExpandEnv("${ProgramFiles(x86)}\\Steam\\config\\appconfig.json")
++	fp := path.Join(steamConfigDir(), "appconfig.json")
+ 
+ 	_, err := os.ReadFile(fp)
+ 
+diff --git a/process_other.go b/process_other.go
+index eac7ac7..107ac0a 100644
+--- a/process_other.go
++++ b/process_other.go
+@@ -3,6 +3,40 @@
+ 
+ package main
+ 
++import (
++	"os"
++	"strconv"
++	"strings"
++)
++
++// isProcRunning checks /proc for a process whose comm matches one of names.
++// Callers pass Windows-style names like "vrserver.exe"; SteamVR's Linux
++// binary is just "vrserver", so the ".exe" suffix is stripped before matching.
+ func isProcRunning(names ...string) (bool, error) {
++	entries, err := os.ReadDir("/proc")
++	if err != nil {
++		return false, err
++	}
++
++	want := make(map[string]bool, len(names))
++	for _, name := range names {
++		want[strings.ToLower(strings.TrimSuffix(name, ".exe"))] = true
++	}
++
++	for _, entry := range entries {
++		if _, err := strconv.Atoi(entry.Name()); err != nil {
++			continue
++		}
++
++		comm, err := os.ReadFile("/proc/" + entry.Name() + "/comm")
++		if err != nil {
++			continue
++		}
++
++		if want[strings.ToLower(strings.TrimSpace(string(comm)))] {
++			return true, nil
++		}
++	}
++
+ 	return false, nil
+ }
+diff --git a/steam_darwin.go b/steam_darwin.go
+new file mode 100644
+index 0000000..3351226
+--- /dev/null
++++ b/steam_darwin.go
+@@ -0,0 +1,18 @@
++//go:build darwin
++// +build darwin
++
++package main
++
++import (
++	"os"
++	"path"
++)
++
++// steamConfigDir returns Steam's config directory on macOS.
++func steamConfigDir() string {
++	home, err := os.UserHomeDir()
++	if err != nil {
++		return ""
++	}
++	return path.Join(home, "Library", "Application Support", "Steam", "config")
++}
+diff --git a/steam_linux.go b/steam_linux.go
+new file mode 100644
+index 0000000..21f8797
+--- /dev/null
++++ b/steam_linux.go
+@@ -0,0 +1,20 @@
++//go:build linux
++// +build linux
++
++package main
++
++import (
++	"os"
++	"path"
++)
++
++// steamConfigDir returns Steam's config directory for a native Linux
++// package install. Flatpak/Snap Steam use a different prefix and aren't
++// handled here.
++func steamConfigDir() string {
++	home, err := os.UserHomeDir()
++	if err != nil {
++		return ""
++	}
++	return path.Join(home, ".local", "share", "Steam", "config")
++}
+diff --git a/steam_windows.go b/steam_windows.go
+new file mode 100644
+index 0000000..58f5751
+--- /dev/null
++++ b/steam_windows.go
+@@ -0,0 +1,11 @@
++//go:build windows
++// +build windows
++
++package main
++
++import "os"
++
++// steamConfigDir returns Steam's config directory on Windows.
++func steamConfigDir() string {
++	return os.ExpandEnv("${ProgramFiles(x86)}\\Steam\\config")
++}
+diff --git a/steamvr/manifest.vrmanifest b/steamvr/manifest.vrmanifest
+index 151cd21..52807c5 100644
+--- a/steamvr/manifest.vrmanifest
++++ b/steamvr/manifest.vrmanifest
+@@ -4,6 +4,8 @@
+ 		"app_key": "com.github.dhcpcd9.base-station-manager",
+ 		"launch_type": "binary",
+ 		"binary_path_windows": "%EXECUTABLE%",
++		"binary_path_linux": "%EXECUTABLE%",
++		"binary_path_osx": "%EXECUTABLE%",
+ 		"is_dashboard_overlay": true,
+ 
+ 		"strings": {
+-- 
+2.55.0
+
+
+From b9dadbf491cb5e2f52076557e71782c56a8c1d2a Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Wed, 23 Sep 2026 02:31:00 +0200
+Subject: [PATCH 2/3] fix(linux): always show the window when the app is
+ launched again
+
+A second launch only pokes the running instance (SingleInstanceLock). It
+used to show the window only when SteamVR wasn't running, but on desktops
+without a working tray icon (vanilla GNOME on Wayland) launching the app
+again is the only way to get a hidden window back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app.go | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/app.go b/app.go
+index 8aa0d8b..4c867a7 100644
+--- a/app.go
++++ b/app.go
+@@ -73,9 +73,11 @@ func (a *App) startup(ctx context.Context) {
+ 
+ 			running, _ := isProcRunning("vrserver.exe")
+ 
+-			if !running && config.IsSteamVRManaged {
+-				wruntime.WindowShow(a.ctx)
+-			}
++			// This fires on a second launch attempt (SingleInstanceLock),
++			// so always surface the window - relaunching the app is the
++			// only way back once it's hidden on platforms without a
++			// working tray icon (e.g. vanilla GNOME on Wayland).
++			wruntime.WindowShow(a.ctx)
+ 
+ 			WEBSOCKET_BROADCAST.Broadcast(preparePacket("steamvr.status", map[string]interface{}{
+ 				"status": running,
+-- 
+2.55.0
+
+
+From f631dc665d3abf26e15466a72702b1e9254de0fa Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Fri, 25 Sep 2026 20:49:55 +0200
+Subject: [PATCH 3/3] fix(linux): notice when SteamVR stops, so the stations go
+ to sleep
+
+waitForSteamVR (websockets.go) and IsSteamVRConnected (app.go) only ran on
+Windows, so on Linux steamvr.status never went false after SteamVR exited:
+the stations were never put to sleep and the app never quit. Both now run on
+Linux too, on top of the /proc based isProcRunning.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app.go        | 2 +-
+ websockets.go | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/app.go b/app.go
+index 4c867a7..b58b8cd 100644
+--- a/app.go
++++ b/app.go
+@@ -482,7 +482,7 @@ func (a *App) IsSteamVRConnectivityAvailable() bool {
+ }
+ 
+ func (a *App) IsSteamVRConnected() bool {
+-	if runtime.GOOS != "windows" {
++	if runtime.GOOS != "windows" && runtime.GOOS != "linux" {
+ 		return false
+ 	}
+ 
+diff --git a/websockets.go b/websockets.go
+index 1750a62..8b15f54 100644
+--- a/websockets.go
++++ b/websockets.go
+@@ -43,7 +43,7 @@ func StartHttp() {
+ 
+ func waitForSteamVR() {
+ 	go func() {
+-		if runtime.GOOS == "windows" {
++		if runtime.GOOS == "windows" || runtime.GOOS == "linux" {
+ 
+ 			log.Println("Started waiting for steamvr")
+ 
+-- 
+2.55.0
+

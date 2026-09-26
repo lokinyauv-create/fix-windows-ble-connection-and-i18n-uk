@@ -84,9 +84,11 @@ func (a *App) startup(ctx context.Context) {
 
 			running, _ := isProcRunning("vrserver.exe")
 
-			if !running && config.IsSteamVRManaged {
-				a.ShowFromTray()
-			}
+			// This fires on a second launch attempt (SingleInstanceLock),
+			// so always surface the window - relaunching the app is the
+			// only way back once it's hidden on platforms without a
+			// working tray icon (e.g. vanilla GNOME on Wayland).
+			a.ShowFromTray()
 
 			WEBSOCKET_BROADCAST.Broadcast(preparePacket("steamvr.status", map[string]interface{}{
 				"status": running,
@@ -650,7 +652,7 @@ func (a *App) IsSteamVRConnectivityAvailable() bool {
 }
 
 func (a *App) IsSteamVRConnected() bool {
-	if runtime.GOOS != "windows" {
+	if runtime.GOOS != "windows" && runtime.GOOS != "linux" {
 		return false
 	}
 
