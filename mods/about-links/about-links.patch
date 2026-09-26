@@ -1,0 +1,51 @@
+From 5b2d41ef129b59df049c11dd23435b54346363db Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Mon, 3 Aug 2026 22:33:49 +0200
+Subject: [PATCH] fix(ui): re-enable the About/Source code links
+
+BrowserOpenURL calls for "Made by Alumi", "Design by Klonerovsky" and
+"Source code" were commented out during the TypeScript migration
+(bf383c0) and never restored, so the links have done nothing since
+June 2025.
+
+(cherry picked from commit 7b48881e1673566d4f18cf9dee95b77b87cf449f)
+---
+ frontend/src/views/SoftwareSettings.tsx | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/frontend/src/views/SoftwareSettings.tsx b/frontend/src/views/SoftwareSettings.tsx
+index d8888f1..b1bcb38 100644
+--- a/frontend/src/views/SoftwareSettings.tsx
++++ b/frontend/src/views/SoftwareSettings.tsx
+@@ -178,7 +178,8 @@ export function SoftwareSettings() {
+                 <span>
+                     <Trans i18nKey={"Made By"}>
+                         Made by <button className='text-[#1D81FF] hover:text-[#66AAFF] duration-150 cursor-pointer' onClick={() => {
+-                            // window.runtime.BrowserOpenURL("https://lisek.cc")
++                            //@ts-ignore
++                            window.runtime.BrowserOpenURL("https://lisek.cc")
+                         }}>Alumi</button>
+                     </Trans>
+                 </span>
+@@ -186,14 +187,16 @@ export function SoftwareSettings() {
+                 <span>
+                     <Trans i18nKey={"Design By"}>
+                         Design by <button className='text-[#1D81FF] hover:text-[#66AAFF] duration-150 cursor-pointer' onClick={() => {
+-                            // window.runtime.BrowserOpenURL("https://github.com/klonerovsky183")
++                            //@ts-ignore
++                            window.runtime.BrowserOpenURL("https://github.com/klonerovsky183")
+                         }}>Klonerovsky</button>
+                     </Trans>
+                 </span>
+ 
+                 <span>
+                     <button className='text-[#1D81FF] hover:text-[#66AAFF] duration-150 cursor-pointer' onClick={() => {
+-                        //  window.runtime.BrowserOpenURL("https://github.com/DHCPCD9/go-steamvr-lighthouse-manager")} 
++                        //@ts-ignore
++                        window.runtime.BrowserOpenURL("https://github.com/DHCPCD9/go-steamvr-lighthouse-manager")
+                     }}>{t("Source code")}</button>
+                 </span>
+             </div>
+-- 
+2.55.0
+
