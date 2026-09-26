@@ -1,0 +1,337 @@
+From fa793e48b00a1496f5ebac2563cb3643dd4850b5 Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Sat, 12 Sep 2026 00:34:20 +0200
+Subject: [PATCH 1/2] chore: regenerate Wails runtime and Windows installer
+ files
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Output of a newer Wails CLI: frontend/wailsjs/runtime, build/windows/installer/wails_tools.nsh, frontend/package.json.md5, and systray promoted to a direct dependency in go.mod. No functional change.
+
+Originally committed as "Додоно збережиня зони. Фікси" (1d489bd); despite the title it contains no play-area code.
+
+(cherry picked from commit 1d489bd5d0f38cb34f9a472718cae6292926bd11)
+---
+ build/windows/installer/wails_tools.nsh | 55 +++++++++++++---
+ frontend/package.json.md5               |  2 +-
+ frontend/wailsjs/runtime/runtime.d.ts   | 83 ++++++++++++++++++++++++-
+ frontend/wailsjs/runtime/runtime.js     | 60 ++++++++++++++++++
+ go.mod                                  |  2 +-
+ 5 files changed, 189 insertions(+), 13 deletions(-)
+
+diff --git a/build/windows/installer/wails_tools.nsh b/build/windows/installer/wails_tools.nsh
+index 52a2dbf..9671ac5 100644
+--- a/build/windows/installer/wails_tools.nsh
++++ b/build/windows/installer/wails_tools.nsh
+@@ -115,23 +115,59 @@ RequestExecutionLevel "${REQUEST_EXECUTION_LEVEL}"
+     WriteUninstaller "$INSTDIR\uninstall.exe"
+ 
+     SetRegView 64
+-    WriteRegStr HKLM "${UNINST_KEY}" "Publisher" "${INFO_COMPANYNAME}"
+-    WriteRegStr HKLM "${UNINST_KEY}" "DisplayName" "${INFO_PRODUCTNAME}"
+-    WriteRegStr HKLM "${UNINST_KEY}" "DisplayVersion" "${INFO_PRODUCTVERSION}"
+-    WriteRegStr HKLM "${UNINST_KEY}" "DisplayIcon" "$INSTDIR\${PRODUCT_EXECUTABLE}"
+-    WriteRegStr HKLM "${UNINST_KEY}" "UninstallString" "$\"$INSTDIR\uninstall.exe$\""
+-    WriteRegStr HKLM "${UNINST_KEY}" "QuietUninstallString" "$\"$INSTDIR\uninstall.exe$\" /S"
++    !ifdef WAILS_INSTALL_SCOPE
++      !if "${WAILS_INSTALL_SCOPE}" == "user"
++        WriteRegStr HKCU "${UNINST_KEY}" "Publisher" "${INFO_COMPANYNAME}"
++        WriteRegStr HKCU "${UNINST_KEY}" "DisplayName" "${INFO_PRODUCTNAME}"
++        WriteRegStr HKCU "${UNINST_KEY}" "DisplayVersion" "${INFO_PRODUCTVERSION}"
++        WriteRegStr HKCU "${UNINST_KEY}" "DisplayIcon" "$INSTDIR\${PRODUCT_EXECUTABLE}"
++        WriteRegStr HKCU "${UNINST_KEY}" "UninstallString" "$\"$INSTDIR\uninstall.exe$\""
++        WriteRegStr HKCU "${UNINST_KEY}" "QuietUninstallString" "$\"$INSTDIR\uninstall.exe$\" /S"
++      !else
++        WriteRegStr HKLM "${UNINST_KEY}" "Publisher" "${INFO_COMPANYNAME}"
++        WriteRegStr HKLM "${UNINST_KEY}" "DisplayName" "${INFO_PRODUCTNAME}"
++        WriteRegStr HKLM "${UNINST_KEY}" "DisplayVersion" "${INFO_PRODUCTVERSION}"
++        WriteRegStr HKLM "${UNINST_KEY}" "DisplayIcon" "$INSTDIR\${PRODUCT_EXECUTABLE}"
++        WriteRegStr HKLM "${UNINST_KEY}" "UninstallString" "$\"$INSTDIR\uninstall.exe$\""
++        WriteRegStr HKLM "${UNINST_KEY}" "QuietUninstallString" "$\"$INSTDIR\uninstall.exe$\" /S"
++      !endif
++    !else
++        WriteRegStr HKLM "${UNINST_KEY}" "Publisher" "${INFO_COMPANYNAME}"
++        WriteRegStr HKLM "${UNINST_KEY}" "DisplayName" "${INFO_PRODUCTNAME}"
++        WriteRegStr HKLM "${UNINST_KEY}" "DisplayVersion" "${INFO_PRODUCTVERSION}"
++        WriteRegStr HKLM "${UNINST_KEY}" "DisplayIcon" "$INSTDIR\${PRODUCT_EXECUTABLE}"
++        WriteRegStr HKLM "${UNINST_KEY}" "UninstallString" "$\"$INSTDIR\uninstall.exe$\""
++        WriteRegStr HKLM "${UNINST_KEY}" "QuietUninstallString" "$\"$INSTDIR\uninstall.exe$\" /S"
++    !endif
+ 
+     ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
+     IntFmt $0 "0x%08X" $0
+-    WriteRegDWORD HKLM "${UNINST_KEY}" "EstimatedSize" "$0"
++
++    !ifdef WAILS_INSTALL_SCOPE
++      !if "${WAILS_INSTALL_SCOPE}" == "user"
++        WriteRegDWORD HKCU "${UNINST_KEY}" "EstimatedSize" "$0"
++      !else
++        WriteRegDWORD HKLM "${UNINST_KEY}" "EstimatedSize" "$0"
++      !endif
++    !else
++        WriteRegDWORD HKLM "${UNINST_KEY}" "EstimatedSize" "$0"
++    !endif
+ !macroend
+ 
+ !macro wails.deleteUninstaller
+     Delete "$INSTDIR\uninstall.exe"
+ 
+     SetRegView 64
+-    DeleteRegKey HKLM "${UNINST_KEY}"
++
++    !ifdef WAILS_INSTALL_SCOPE
++      !if "${WAILS_INSTALL_SCOPE}" == "user"
++        DeleteRegKey HKCU "${UNINST_KEY}"
++      !else
++        DeleteRegKey HKLM "${UNINST_KEY}"
++      !endif
++    !else
++        DeleteRegKey HKLM "${UNINST_KEY}"
++    !endif
+ !macroend
+ 
+ !macro wails.setShellContext
+@@ -158,7 +194,7 @@ RequestExecutionLevel "${REQUEST_EXECUTION_LEVEL}"
+ 
+     ${If} ${REQUEST_EXECUTION_LEVEL} == "user"
+         # If the installer is run in user level, check the user specific key exists and is not empty then webview2 is already installed
+-	    ReadRegStr $0 HKCU "Software\Microsoft\EdgeUpdate\Clients{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" "pv"
++	    ReadRegStr $0 HKCU "Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" "pv"
+         ${If} $0 != ""
+             Goto ok
+         ${EndIf}
+@@ -183,7 +219,6 @@ RequestExecutionLevel "${REQUEST_EXECUTION_LEVEL}"
+   ; Backup the previously associated file class
+   ReadRegStr $R0 SHELL_CONTEXT "Software\Classes\.${EXT}" ""
+   WriteRegStr SHELL_CONTEXT "Software\Classes\.${EXT}" "${FILECLASS}_backup" "$R0"
+-
+   WriteRegStr SHELL_CONTEXT "Software\Classes\.${EXT}" "" "${FILECLASS}"
+ 
+   WriteRegStr SHELL_CONTEXT "Software\Classes\${FILECLASS}" "" `${DESCRIPTION}`
+diff --git a/frontend/package.json.md5 b/frontend/package.json.md5
+index 81e9521..eddd3b7 100644
+--- a/frontend/package.json.md5
++++ b/frontend/package.json.md5
+@@ -1 +1 @@
+-e05c736313f33a3a2a96974c06055cbe
+\ No newline at end of file
++3e579caff574877237408e08e33e9d67
+\ No newline at end of file
+diff --git a/frontend/wailsjs/runtime/runtime.d.ts b/frontend/wailsjs/runtime/runtime.d.ts
+index 4445dac..3bbea84 100644
+--- a/frontend/wailsjs/runtime/runtime.d.ts
++++ b/frontend/wailsjs/runtime/runtime.d.ts
+@@ -246,4 +246,85 @@ export function OnFileDropOff() :void
+ export function CanResolveFilePaths(): boolean;
+ 
+ // Resolves file paths for an array of files
+-export function ResolveFilePaths(files: File[]): void
+\ No newline at end of file
++export function ResolveFilePaths(files: File[]): void
++
++// Notification types
++export interface NotificationOptions {
++    id: string;
++    title: string;
++    subtitle?: string; // macOS and Linux only
++    body?: string;
++    categoryId?: string;
++    data?: { [key: string]: any };
++}
++
++export interface NotificationAction {
++    id?: string;
++    title?: string;
++    destructive?: boolean; // macOS-specific
++}
++
++export interface NotificationCategory {
++    id?: string;
++    actions?: NotificationAction[];
++    hasReplyField?: boolean;
++    replyPlaceholder?: string;
++    replyButtonTitle?: string;
++}
++
++// [InitializeNotifications](https://wails.io/docs/reference/runtime/notification#initializenotifications)
++// Initializes the notification service for the application.
++// This must be called before sending any notifications.
++export function InitializeNotifications(): Promise<void>;
++
++// [CleanupNotifications](https://wails.io/docs/reference/runtime/notification#cleanupnotifications)
++// Cleans up notification resources and releases any held connections.
++export function CleanupNotifications(): Promise<void>;
++
++// [IsNotificationAvailable](https://wails.io/docs/reference/runtime/notification#isnotificationavailable)
++// Checks if notifications are available on the current platform.
++export function IsNotificationAvailable(): Promise<boolean>;
++
++// [RequestNotificationAuthorization](https://wails.io/docs/reference/runtime/notification#requestnotificationauthorization)
++// Requests notification authorization from the user (macOS only).
++export function RequestNotificationAuthorization(): Promise<boolean>;
++
++// [CheckNotificationAuthorization](https://wails.io/docs/reference/runtime/notification#checknotificationauthorization)
++// Checks the current notification authorization status (macOS only).
++export function CheckNotificationAuthorization(): Promise<boolean>;
++
++// [SendNotification](https://wails.io/docs/reference/runtime/notification#sendnotification)
++// Sends a basic notification with the given options.
++export function SendNotification(options: NotificationOptions): Promise<void>;
++
++// [SendNotificationWithActions](https://wails.io/docs/reference/runtime/notification#sendnotificationwithactions)
++// Sends a notification with action buttons. Requires a registered category.
++export function SendNotificationWithActions(options: NotificationOptions): Promise<void>;
++
++// [RegisterNotificationCategory](https://wails.io/docs/reference/runtime/notification#registernotificationcategory)
++// Registers a notification category that can be used with SendNotificationWithActions.
++export function RegisterNotificationCategory(category: NotificationCategory): Promise<void>;
++
++// [RemoveNotificationCategory](https://wails.io/docs/reference/runtime/notification#removenotificationcategory)
++// Removes a previously registered notification category.
++export function RemoveNotificationCategory(categoryId: string): Promise<void>;
++
++// [RemoveAllPendingNotifications](https://wails.io/docs/reference/runtime/notification#removeallpendingnotifications)
++// Removes all pending notifications from the notification center.
++export function RemoveAllPendingNotifications(): Promise<void>;
++
++// [RemovePendingNotification](https://wails.io/docs/reference/runtime/notification#removependingnotification)
++// Removes a specific pending notification by its identifier.
++export function RemovePendingNotification(identifier: string): Promise<void>;
++
++// [RemoveAllDeliveredNotifications](https://wails.io/docs/reference/runtime/notification#removealldeliverednotifications)
++// Removes all delivered notifications from the notification center.
++export function RemoveAllDeliveredNotifications(): Promise<void>;
++
++// [RemoveDeliveredNotification](https://wails.io/docs/reference/runtime/notification#removedeliverednotification)
++// Removes a specific delivered notification by its identifier.
++export function RemoveDeliveredNotification(identifier: string): Promise<void>;
++
++// [RemoveNotification](https://wails.io/docs/reference/runtime/notification#removenotification)
++// Removes a notification by its identifier (cross-platform convenience function).
++export function RemoveNotification(identifier: string): Promise<void>;
+\ No newline at end of file
+diff --git a/frontend/wailsjs/runtime/runtime.js b/frontend/wailsjs/runtime/runtime.js
+index 623397b..556621e 100644
+--- a/frontend/wailsjs/runtime/runtime.js
++++ b/frontend/wailsjs/runtime/runtime.js
+@@ -48,6 +48,10 @@ export function EventsOff(eventName, ...additionalEventNames) {
+     return window.runtime.EventsOff(eventName, ...additionalEventNames);
+ }
+ 
++export function EventsOffAll() {
++  return window.runtime.EventsOffAll();
++}
++
+ export function EventsOnce(eventName, callback) {
+     return EventsOnMultiple(eventName, callback, 1);
+ }
+@@ -235,4 +239,60 @@ export function CanResolveFilePaths() {
+ 
+ export function ResolveFilePaths(files) {
+     return window.runtime.ResolveFilePaths(files);
++}
++
++export function InitializeNotifications() {
++    return window.runtime.InitializeNotifications();
++}
++
++export function CleanupNotifications() {
++    return window.runtime.CleanupNotifications();
++}
++
++export function IsNotificationAvailable() {
++    return window.runtime.IsNotificationAvailable();
++}
++
++export function RequestNotificationAuthorization() {
++    return window.runtime.RequestNotificationAuthorization();
++}
++
++export function CheckNotificationAuthorization() {
++    return window.runtime.CheckNotificationAuthorization();
++}
++
++export function SendNotification(options) {
++    return window.runtime.SendNotification(options);
++}
++
++export function SendNotificationWithActions(options) {
++    return window.runtime.SendNotificationWithActions(options);
++}
++
++export function RegisterNotificationCategory(category) {
++    return window.runtime.RegisterNotificationCategory(category);
++}
++
++export function RemoveNotificationCategory(categoryId) {
++    return window.runtime.RemoveNotificationCategory(categoryId);
++}
++
++export function RemoveAllPendingNotifications() {
++    return window.runtime.RemoveAllPendingNotifications();
++}
++
++export function RemovePendingNotification(identifier) {
++    return window.runtime.RemovePendingNotification(identifier);
++}
++
++export function RemoveAllDeliveredNotifications() {
++    return window.runtime.RemoveAllDeliveredNotifications();
++}
++
++export function RemoveDeliveredNotification(identifier) {
++    return window.runtime.RemoveDeliveredNotification(identifier);
++}
++
++export function RemoveNotification(identifier) {
++    return window.runtime.RemoveNotification(identifier);
+ }
+\ No newline at end of file
+diff --git a/go.mod b/go.mod
+index 7b8537a..19715c6 100644
+--- a/go.mod
++++ b/go.mod
+@@ -6,6 +6,7 @@ toolchain go1.24.0
+ 
+ require (
+ 	github.com/gen2brain/beeep v0.0.0-20240516210008-9c006672e7f4
++	github.com/getlantern/systray v1.2.2
+ 	github.com/google/go-github/v69 v69.2.0
+ 	github.com/google/uuid v1.6.0
+ 	github.com/gorilla/websocket v1.5.3
+@@ -25,7 +26,6 @@ require (
+ 	github.com/getlantern/hex v0.0.0-20190417191902-c6586a6fe0b7 // indirect
+ 	github.com/getlantern/hidden v0.0.0-20190325191715-f02dbb02be55 // indirect
+ 	github.com/getlantern/ops v0.0.0-20190325191751-d70cb0d6f85f // indirect
+-	github.com/getlantern/systray v1.2.2 // indirect
+ 	github.com/go-ole/go-ole v1.3.0 // indirect
+ 	github.com/go-stack/stack v1.8.0 // indirect
+ 	github.com/go-toast/toast v0.0.0-20190211030409-01e6764cf0a4 // indirect
+-- 
+2.55.0
+
+
+From 95ab84e38dc971f856c44f61678eb05c8c0fc412 Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Sat, 26 Sep 2026 21:20:00 +0200
+Subject: [PATCH 2/2] chore: update frontend/package.json.md5 as written by
+ wails build
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ frontend/package.json.md5 | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/frontend/package.json.md5 b/frontend/package.json.md5
+index eddd3b7..81e9521 100644
+--- a/frontend/package.json.md5
++++ b/frontend/package.json.md5
+@@ -1 +1 @@
+-3e579caff574877237408e08e33e9d67
+\ No newline at end of file
++e05c736313f33a3a2a96974c06055cbe
+\ No newline at end of file
+-- 
+2.55.0
+
