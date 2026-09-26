@@ -126,6 +126,25 @@ func (a *App) startup(ctx context.Context) {
 // the connection at the daemon level, so it survives the process exiting and
 // the station stays claimed until something explicitly disconnects it.
 func disconnectAllBaseStations() {
+	// A sleep command sent right before exit is still being re-sent to the
+	// write-only stations; disconnecting now would leave them with a single
+	// attempt, which they sometimes ignore. Give the confirmation loops time
+	// to finish first.
+	deadline := time.Now().Add(16 * time.Second)
+	for time.Now().Before(deadline) {
+		pending := false
+		for _, bs := range knownBaseStations.Items() {
+			if bs != nil && (*bs).PowerCommandPending() {
+				pending = true
+				break
+			}
+		}
+		if !pending {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+
 	for name, bs := range knownBaseStations.Items() {
 		if bs == nil {
 			continue
