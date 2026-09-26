@@ -78,15 +78,20 @@ func (a *App) startup(ctx context.Context) {
 
 	a.ctx = ctx
 
+	// Keeps the saved play area applied for the whole SteamVR session.
+	startZoneWatcher()
+
 	go func() {
 		for {
 			<-WAKE_UP_CHANNEL
 
 			running, _ := isProcRunning("vrserver.exe")
 
-			if !running && config.IsSteamVRManaged {
-				a.ShowFromTray()
-			}
+			// This fires on a second launch attempt (SingleInstanceLock),
+			// so always surface the window - relaunching the app is the
+			// only way back once it's hidden on platforms without a
+			// working tray icon (e.g. vanilla GNOME on Wayland).
+			a.ShowFromTray()
 
 			WEBSOCKET_BROADCAST.Broadcast(preparePacket("steamvr.status", map[string]interface{}{
 				"status": running,
@@ -126,6 +131,25 @@ func (a *App) startup(ctx context.Context) {
 // the connection at the daemon level, so it survives the process exiting and
 // the station stays claimed until something explicitly disconnects it.
 func disconnectAllBaseStations() {
+	// A sleep command sent right before exit is still being re-sent to the
+	// write-only stations; disconnecting now would leave them with a single
+	// attempt, which they sometimes ignore. Give the confirmation loops time
+	// to finish first.
+	deadline := time.Now().Add(16 * time.Second)
+	for time.Now().Before(deadline) {
+		pending := false
+		for _, bs := range knownBaseStations.Items() {
+			if bs != nil && (*bs).PowerCommandPending() {
+				pending = true
+				break
+			}
+		}
+		if !pending {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+
 	for name, bs := range knownBaseStations.Items() {
 		if bs == nil {
 			continue
@@ -631,7 +655,7 @@ func (a *App) IsSteamVRConnectivityAvailable() bool {
 }
 
 func (a *App) IsSteamVRConnected() bool {
-	if runtime.GOOS != "windows" {
+	if runtime.GOOS != "windows" && runtime.GOOS != "linux" {
 		return false
 	}
 

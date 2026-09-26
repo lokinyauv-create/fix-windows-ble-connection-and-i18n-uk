@@ -99,6 +99,49 @@ export namespace main {
 		    return a;
 		}
 	}
+	
+	export class RoomStatus {
+	    supported: boolean;
+	    steamvr_running: boolean;
+	    helper_found: boolean;
+	    room_setup_found: boolean;
+	    watcher_running: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new RoomStatus(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.supported = source["supported"];
+	        this.steamvr_running = source["steamvr_running"];
+	        this.helper_found = source["helper_found"];
+	        this.room_setup_found = source["room_setup_found"];
+	        this.watcher_running = source["watcher_running"];
+	    }
+	}
+	export class Zone {
+	    id: string;
+	    name: string;
+	    data?: string;
+	    play_area: number[];
+	    created_at: string;
+	    auto_apply: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new Zone(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.data = source["data"];
+	        this.play_area = source["play_area"];
+	        this.created_at = source["created_at"];
+	        this.auto_apply = source["auto_apply"];
+	    }
+	}
 
 }
 

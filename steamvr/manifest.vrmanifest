@@ -4,6 +4,8 @@
 		"app_key": "com.github.dhcpcd9.base-station-manager",
 		"launch_type": "binary",
 		"binary_path_windows": "%EXECUTABLE%",
+		"binary_path_linux": "%EXECUTABLE%",
+		"binary_path_osx": "%EXECUTABLE%",
 		"is_dashboard_overlay": true,
 
 		"strings": {

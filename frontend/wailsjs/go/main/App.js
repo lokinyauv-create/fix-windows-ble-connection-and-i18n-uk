@@ -6,6 +6,14 @@ export function AddBaseStationToGroup(arg1, arg2) {
   return window['go']['main']['App']['AddBaseStationToGroup'](arg1, arg2);
 }
 
+export function ApplyZone(arg1) {
+  return window['go']['main']['App']['ApplyZone'](arg1);
+}
+
+export function CaptureZone(arg1) {
+  return window['go']['main']['App']['CaptureZone'](arg1);
+}
+
 export function ChangeBaseStationChannel(arg1, arg2) {
   return window['go']['main']['App']['ChangeBaseStationChannel'](arg1, arg2);
 }
@@ -16,6 +24,10 @@ export function ChangeBaseStationPowerStatus(arg1, arg2) {
 
 export function CreateGroup(arg1, arg2) {
   return window['go']['main']['App']['CreateGroup'](arg1, arg2);
+}
+
+export function DeleteZone(arg1) {
+  return window['go']['main']['App']['DeleteZone'](arg1);
 }
 
 export function EnableBluetooth() {
@@ -38,8 +50,16 @@ export function GetFoundBaseStations() {
   return window['go']['main']['App']['GetFoundBaseStations']();
 }
 
+export function GetRoomStatus() {
+  return window['go']['main']['App']['GetRoomStatus']();
+}
+
 export function GetVersion() {
   return window['go']['main']['App']['GetVersion']();
+}
+
+export function GetZoneLog() {
+  return window['go']['main']['App']['GetZoneLog']();
 }
 
 export function HideToTray() {
@@ -66,6 +86,14 @@ export function IsUpdatingSupported() {
   return window['go']['main']['App']['IsUpdatingSupported']();
 }
 
+export function LaunchRoomSetup() {
+  return window['go']['main']['App']['LaunchRoomSetup']();
+}
+
+export function ListZones() {
+  return window['go']['main']['App']['ListZones']();
+}
+
 export function Notify(arg1, arg2) {
   return window['go']['main']['App']['Notify'](arg1, arg2);
 }
@@ -80,6 +108,14 @@ export function RemoveGroup(arg1) {
 
 export function RenameGroup(arg1, arg2) {
   return window['go']['main']['App']['RenameGroup'](arg1, arg2);
+}
+
+export function RenameZone(arg1, arg2) {
+  return window['go']['main']['App']['RenameZone'](arg1, arg2);
+}
+
+export function SetAutoZone(arg1) {
+  return window['go']['main']['App']['SetAutoZone'](arg1);
 }
 
 export function ShowFromTray() {

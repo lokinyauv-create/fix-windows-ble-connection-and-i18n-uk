@@ -77,14 +77,27 @@ func connectToPreloadedBaseStation(bs *LighthouseV2, config BaseStationConfigura
 	bs.FindService()
 	bs.ScanCharacteristics()
 
+	// Finish setting up notifications before the wake command goes out: the
+	// station acks a write that races with that setup and then ignores it.
+	bs.StartCaching()
+
 	if wakeUp {
 		bs.SetPowerState(byte(0x01))
 	}
-
-	go bs.StartCaching()
 }
 
 func (lv *LighthouseV2) StartCaching() {
+	lv.gattMu.Lock()
+	defer lv.gattMu.Unlock()
+
+	// ScanCharacteristics, InitStack and the connect path all ask for this;
+	// enabling notifications twice on the same characteristic only fails
+	// ("unclosed notifications") and gets in the way of power writes.
+	if lv.powerStateCharacteristic == nil || lv.cachingFor == lv.powerStateCharacteristic {
+		return
+	}
+	lv.cachingFor = lv.powerStateCharacteristic
+
 	if lv.powerStateCharacteristic != nil {
 
 		err := lv.powerStateCharacteristic.EnableNotifications(func(buf []byte) {
@@ -96,6 +109,8 @@ func (lv *LighthouseV2) StartCaching() {
 		if err != nil {
 			log.Printf("Failed to receive notifications on power state, base station firmware probably outdated; lighthouse=%s; err=%+v", lv.Id, err)
 			lv.updateAvailable = true
+		} else {
+			lv.powerFeedback = true
 		}
 	}
 
@@ -114,6 +129,12 @@ func (lv *LighthouseV2) StartCaching() {
 }
 
 func (lighthouse *LighthouseV2) Write(characteristic *bluetooth.DeviceCharacteristic, value []byte) (int, error) {
+	lighthouse.gattMu.Lock()
+	defer lighthouse.gattMu.Unlock()
+
+	// Despite the name this is a plain WriteValue without a "type" option, so
+	// BlueZ uses a write request whenever the characteristic supports one and
+	// the call only returns once the station has acknowledged it.
 	bytes, err := characteristic.WriteWithoutResponse(value)
 	return bytes, err
 }
@@ -125,6 +146,8 @@ func (lv *LighthouseV2) Reconnect() {
 	lv.identifyCharacteristic = nil
 	lv.modeCharacteristic = nil
 	lv.powerStateCharacteristic = nil
+	lv.cachingFor = nil
+	lv.powerFeedback = false
 
 	log.Println("Reconnecting...")
 	parsedMac, err := bluetooth.ParseMAC(lv.mac)
