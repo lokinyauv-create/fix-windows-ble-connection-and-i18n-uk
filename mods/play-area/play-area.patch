@@ -1,7 +1,7 @@
 From 83df3d305fe16d5d49ce891265152b678bbeefeb Mon Sep 17 00:00:00 2001
 From: Lina <lokinyauv@gmail.com>
 Date: Mon, 21 Sep 2026 20:58:11 +0200
-Subject: [PATCH 1/4] feat(tools): launcher that keeps SteamVR Room Setup from
+Subject: [PATCH 1/5] feat(tools): launcher that keeps SteamVR Room Setup from
  crashing on Linux/AMD
 
 Room Setup (Unity 5.6) creates a 50x32 image with 7 mip levels; Vulkan allows 6, and Mesa RADV traps (SIGTRAP in Addr2ComputeSurfaceInfo). The VK_LAYER_vrfix_mipclamp layer clamps mipLevels in vkCreateImage/vkCreateImageView and stubs the VK_EXT_debug_utils calls vrclient makes without a NULL check. vr-room-setup also enables SteamVR's envextensions layer with the external memory/semaphore extensions SteamVR adds itself when it launches Room Setup, so a manual launch works.
@@ -396,7 +396,7 @@ index 0000000..652548c
 From 8481a91733d985de557db4055c5ef7c1f9aa1454 Mon Sep 17 00:00:00 2001
 From: Lina <lokinyauv@gmail.com>
 Date: Tue, 22 Sep 2026 00:34:05 +0200
-Subject: [PATCH 2/4] feat(tools): vrchap-io, export/import the live SteamVR
+Subject: [PATCH 2/5] feat(tools): vrchap-io, export/import the live SteamVR
  play area
 
 A tiny OpenVR client: 'check', 'export' (IVRChaperoneSetup::ExportLiveToBuffer) and 'import' (ImportFromBufferToWorking + CommitWorkingCopy), the same calls Room Setup uses. It refuses to start SteamVR itself (exit code 3 when vrserver isn't running).
@@ -589,7 +589,7 @@ index 0000000..2a8fa35
 From e700d466e0a9da411d6d158b7827750340a7192d Mon Sep 17 00:00:00 2001
 From: Lina <lokinyauv@gmail.com>
 Date: Sat, 26 Sep 2026 21:15:00 +0200
-Subject: [PATCH 3/4] feat: Room page - saved play areas, auto re-apply and
+Subject: [PATCH 3/5] feat: Room page - saved play areas, auto re-apply and
  Room Setup
 
 Folds the standalone vr-zones tool and the Room Setup launcher into the app (Linux; other platforms get stubs):
@@ -1846,7 +1846,7 @@ index 0000000..c4adf90
 From d293eba33cc6d082b93dbd3ff23f8f940365fcc0 Mon Sep 17 00:00:00 2001
 From: Lina <lokinyauv@gmail.com>
 Date: Sat, 26 Sep 2026 23:44:28 +0200
-Subject: [PATCH 4/4] fix(play-area): give SteamVR up to 2 min to settle the
+Subject: [PATCH 4/5] fix(play-area): give SteamVR up to 2 min to settle the
  universe before applying
 
 In a live session (2026-09-26 22:01) the auto zone only went in on attempt
@@ -1919,6 +1919,171 @@ index cff3f8a..11e418d 100644
  	}
 -	zoneLogf("не вдалося застосувати зону при старті")
 +	zoneLogf("не вдалося застосувати зону за 2 хвилини; спробую знову після перекалібрування станцій")
+ }
+ 
+ // ---------- bindings -----------------------------------------------------------------------------
+-- 
+2.55.0
+
+
+From f47ac2258b22d8b464579b8745391364fafa0f1f Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Sun, 27 Sep 2026 06:25:49 +0200
+Subject: [PATCH 5/5] fix(play-area): stop re-applying the zone after base
+ station recalibration
+
+The watcher re-applied the auto zone ~3 s after every "CALIBRATED base" in
+vrserver.txt. Controllers and trackers log that whenever they re-acquire a
+station, so it fired constantly - and each time it snapped back a play
+space the user had moved on purpose (raising themselves in VR). With the
+space untouched, SteamVR answered "Standing origin did not change", so the
+trigger never corrected any drift either (2026-09-27 logs).
+
+Apply the auto zone only once per SteamVR session (and manually from the
+Room page).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ frontend/src/localization/locales/en.json |  2 +-
+ playarea_linux.go                         | 73 ++++-------------------
+ 2 files changed, 13 insertions(+), 62 deletions(-)
+
+diff --git a/frontend/src/localization/locales/en.json b/frontend/src/localization/locales/en.json
+index 493cc64..117e865 100644
+--- a/frontend/src/localization/locales/en.json
++++ b/frontend/src/localization/locales/en.json
+@@ -61,7 +61,7 @@
+     "Zone saved": "Zone saved",
+     "Save": "Save",
+     "No saved zones yet": "No saved zones yet",
+-    "Apply automatically when SteamVR starts and after base station recalibration": "Apply automatically when SteamVR starts and after base station recalibration",
++    "Apply automatically when SteamVR starts and after base station recalibration": "Apply automatically when SteamVR starts",
+     "Auto": "Auto",
+     "Apply now": "Apply now",
+     "Zone applied": "Zone applied",
+diff --git a/playarea_linux.go b/playarea_linux.go
+index 11e418d..0165ae3 100644
+--- a/playarea_linux.go
++++ b/playarea_linux.go
+@@ -18,7 +18,6 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+-	"io"
+ 	"log"
+ 	"os"
+ 	"os/exec"
+@@ -107,10 +106,6 @@ func zonesFile() string {
+ 	return filepath.Join(dir, "vr-zones", "zones.json")
+ }
+ 
+-func vrserverLogPath() string {
+-	return filepath.Join(homeDir(), ".local", "share", "Steam", "logs", "vrserver.txt")
+-}
+-
+ func fileExists(p string) bool {
+ 	_, err := os.Stat(p)
+ 	return err == nil
+@@ -358,11 +353,16 @@ func newZoneId() string {
+ 
+ // ---------- watcher ------------------------------------------------------------------------------
+ 
+-// startZoneWatcher re-applies the auto zone (1) once per SteamVR session, as
+-// soon as the room is reachable, and (2) after every base station tilt
+-// recalibration ("CALIBRATED base" in vrserver.txt), which is when the floor
+-// and bounds drift. It runs for the life of the app - SteamVR launches us for
+-// every session and we quit when it stops.
++// startZoneWatcher applies the auto zone once per SteamVR session, as soon as
++// the room is reachable. It runs for the life of the app - SteamVR launches us
++// for every session and we quit when it stops.
++//
++// It used to re-apply the zone after every base station tilt recalibration
++// ("CALIBRATED base" in vrserver.txt) as well. Logs showed that never fixed
++// anything - with the play space untouched SteamVR answered "Standing origin
++// did not change" - while a controller re-acquiring a station (which happens
++// all the time) snapped back any play space the user had deliberately moved,
++// e.g. raising themselves.
+ func startZoneWatcher() {
+ 	zoneWatchO.Do(func() { go zoneWatcher() })
+ }
+@@ -380,8 +380,6 @@ func zoneWatcher() {
+ 		zoneLogf("%s: %s (%s)", tool.name, tool.path, state)
+ 	}
+ 	lastPid := ""
+-	var logPos int64 = -1
+-	var pendingAt time.Time
+ 
+ 	for {
+ 		pid := vrserverPid()
+@@ -390,61 +388,14 @@ func zoneWatcher() {
+ 			lastPid = pid
+ 			zoneLogf("SteamVR запущений (vrserver %s)", pid)
+ 			sessionApply(pid)
+-			logPos = logSize()
+ 		case pid == "" && lastPid != "":
+ 			zoneLogf("SteamVR закрився")
+-			lastPid, logPos, pendingAt = "", -1, time.Time{}
+-		case pid != "" && logPos >= 0:
+-			var hit bool
+-			logPos, hit = scanRecalibrations(logPos)
+-			if hit {
+-				// Several stations recalibrate in a row; wait for 3 s of quiet.
+-				pendingAt = time.Now().Add(3 * time.Second)
+-			}
+-		}
+-
+-		if !pendingAt.IsZero() && time.Now().After(pendingAt) {
+-			pendingAt = time.Time{}
+-			if id := autoZoneId(); id != "" {
+-				zoneLogf("станція наново відкалібрувала нахил — перезастосовую зону")
+-				if msg, err := applyZoneById(id); err != nil {
+-					zoneLogf("не вдалося застосувати після перекалібрування: %v", err)
+-				} else {
+-					zoneLogf("%s", msg)
+-				}
+-			}
++			lastPid = ""
+ 		}
+ 		time.Sleep(2 * time.Second)
+ 	}
+ }
+ 
+-func logSize() int64 {
+-	info, err := os.Stat(vrserverLogPath())
+-	if err != nil {
+-		return 0
+-	}
+-	return info.Size()
+-}
+-
+-func scanRecalibrations(from int64) (int64, bool) {
+-	f, err := os.Open(vrserverLogPath())
+-	if err != nil {
+-		return from, false
+-	}
+-	defer f.Close()
+-	if info, err := f.Stat(); err == nil && info.Size() < from {
+-		from = 0 // log was rotated by a new session
+-	}
+-	if _, err := f.Seek(from, io.SeekStart); err != nil {
+-		return from, false
+-	}
+-	chunk, err := io.ReadAll(f)
+-	if err != nil {
+-		return from, false
+-	}
+-	return from + int64(len(chunk)), bytes.Contains(chunk, []byte("CALIBRATED base"))
+-}
+-
+ func sessionApply(pid string) {
+ 	id := autoZoneId()
+ 	if id == "" {
+@@ -495,7 +446,7 @@ func sessionApply(pid string) {
+ 		}
+ 		time.Sleep(5 * time.Second)
+ 	}
+-	zoneLogf("не вдалося застосувати зону за 2 хвилини; спробую знову після перекалібрування станцій")
++	zoneLogf("не вдалося застосувати зону за 2 хвилини; застосуйте її вручну на сторінці «Кімната»")
  }
  
  // ---------- bindings -----------------------------------------------------------------------------
