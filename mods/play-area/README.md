@@ -1,15 +1,14 @@
 # mod: play-area — saved SteamVR play areas, auto re-apply, and a Room Setup that doesn't crash
 
 **Branch:** `mod/play-area` · **Base:** upstream `main` · **Depends on:** nothing
-**Platforms:** Linux (other platforms compile with stubs) · **Commits:** 4 (2026-09-21 … 09-26)
+**Platforms:** Linux (other platforms compile with stubs) · **Commits:** 5 (2026-09-21 … 09-27)
 
 [Українською](README.uk.md) · [All mods](../README.md)
 
 ## Problems
 
-1. SteamVR's floor and bounds drift. Every time a base station's tilt is re-measured (after
-   sleep/wake or a short tracking loss, logged as `CALIBRATED base` in `vrserver.txt`), the
-   floor and the play area shift a little.
+1. The play area gets lost or moved (a new session, a stray drag, a bad calibration), and
+   there is no quick way to put a known-good one back.
 2. SteamVR Room Setup crashes on Linux with AMD (Mesa RADV), so a drifted room can't be
    fixed the normal way.
 
@@ -23,8 +22,9 @@
 - A **watcher** that starts with the app. SteamVR auto-launches the app, so it covers every
   session. It applies the Auto zone once SteamVR is ready (waits up to 4 min for OpenVR, then
   keeps trying for up to 2 min while SteamVR settles the universe; in a real session that
-  took ~25 s), and again after every `CALIBRATED base`, 3 s after the last one. When it
-  starts, the log shows where the helpers were found.
+  took ~25 s). It does **not** touch the zone again during the session, so a play space
+  you move on purpose (e.g. raising yourself) stays where you put it. When it starts, the
+  log shows where the helpers were found.
 - `tools/vrchap-io`: a tiny OpenVR client with `check` / `export` / `import` of the **live**
   chaperone (`IVRChaperoneSetup::ExportLiveToBuffer`, `ImportFromBufferToWorking` +
   `CommitWorkingCopy`, the same calls Room Setup makes). It never starts SteamVR itself
@@ -56,7 +56,10 @@ executable (`tools/…`), then in the source tree (`build/bin/../../tools/…`).
 - **Any app** can save and restore the play area with the two OpenVR calls above. Keep the
   raw JSON blob, compare `universeID` before applying (a different universe means the stations
   were moved), and read big IDs as strings or `json.Number`.
-- To fight drift, tail `vrserver.txt` for `CALIBRATED base`, debounce, and re-apply.
+- **Don't** re-apply automatically on `CALIBRATED base` (controllers re-acquiring a
+  station). An earlier version did that; logs showed SteamVR answered "Standing origin did
+  not change" whenever the space was untouched, so it never corrected anything, while it
+  snapped back every play space the user had moved on purpose. Removed 2026-09-27.
 - Unity/RADV mip crash: reuse `tools/room-setup-fix` as is for any Vulkan app that asks
   for more mips than `floor(log2(max(w,h)))+1`. Enable it with `VK_ADD_LAYER_PATH` +
   `VK_LOADER_LAYERS_ENABLE`.

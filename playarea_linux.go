@@ -18,7 +18,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -105,10 +104,6 @@ func zonesFile() string {
 		dir = filepath.Join(homeDir(), ".config")
 	}
 	return filepath.Join(dir, "vr-zones", "zones.json")
-}
-
-func vrserverLogPath() string {
-	return filepath.Join(homeDir(), ".local", "share", "Steam", "logs", "vrserver.txt")
 }
 
 func fileExists(p string) bool {
@@ -358,11 +353,16 @@ func newZoneId() string {
 
 // ---------- watcher ------------------------------------------------------------------------------
 
-// startZoneWatcher re-applies the auto zone (1) once per SteamVR session, as
-// soon as the room is reachable, and (2) after every base station tilt
-// recalibration ("CALIBRATED base" in vrserver.txt), which is when the floor
-// and bounds drift. It runs for the life of the app - SteamVR launches us for
-// every session and we quit when it stops.
+// startZoneWatcher applies the auto zone once per SteamVR session, as soon as
+// the room is reachable. It runs for the life of the app - SteamVR launches us
+// for every session and we quit when it stops.
+//
+// It used to re-apply the zone after every base station tilt recalibration
+// ("CALIBRATED base" in vrserver.txt) as well. Logs showed that never fixed
+// anything - with the play space untouched SteamVR answered "Standing origin
+// did not change" - while a controller re-acquiring a station (which happens
+// all the time) snapped back any play space the user had deliberately moved,
+// e.g. raising themselves.
 func startZoneWatcher() {
 	zoneWatchO.Do(func() { go zoneWatcher() })
 }
@@ -380,8 +380,6 @@ func zoneWatcher() {
 		zoneLogf("%s: %s (%s)", tool.name, tool.path, state)
 	}
 	lastPid := ""
-	var logPos int64 = -1
-	var pendingAt time.Time
 
 	for {
 		pid := vrserverPid()
@@ -390,59 +388,12 @@ func zoneWatcher() {
 			lastPid = pid
 			zoneLogf("SteamVR запущений (vrserver %s)", pid)
 			sessionApply(pid)
-			logPos = logSize()
 		case pid == "" && lastPid != "":
 			zoneLogf("SteamVR закрився")
-			lastPid, logPos, pendingAt = "", -1, time.Time{}
-		case pid != "" && logPos >= 0:
-			var hit bool
-			logPos, hit = scanRecalibrations(logPos)
-			if hit {
-				// Several stations recalibrate in a row; wait for 3 s of quiet.
-				pendingAt = time.Now().Add(3 * time.Second)
-			}
-		}
-
-		if !pendingAt.IsZero() && time.Now().After(pendingAt) {
-			pendingAt = time.Time{}
-			if id := autoZoneId(); id != "" {
-				zoneLogf("станція наново відкалібрувала нахил — перезастосовую зону")
-				if msg, err := applyZoneById(id); err != nil {
-					zoneLogf("не вдалося застосувати після перекалібрування: %v", err)
-				} else {
-					zoneLogf("%s", msg)
-				}
-			}
+			lastPid = ""
 		}
 		time.Sleep(2 * time.Second)
 	}
-}
-
-func logSize() int64 {
-	info, err := os.Stat(vrserverLogPath())
-	if err != nil {
-		return 0
-	}
-	return info.Size()
-}
-
-func scanRecalibrations(from int64) (int64, bool) {
-	f, err := os.Open(vrserverLogPath())
-	if err != nil {
-		return from, false
-	}
-	defer f.Close()
-	if info, err := f.Stat(); err == nil && info.Size() < from {
-		from = 0 // log was rotated by a new session
-	}
-	if _, err := f.Seek(from, io.SeekStart); err != nil {
-		return from, false
-	}
-	chunk, err := io.ReadAll(f)
-	if err != nil {
-		return from, false
-	}
-	return from + int64(len(chunk)), bytes.Contains(chunk, []byte("CALIBRATED base"))
 }
 
 func sessionApply(pid string) {
@@ -495,7 +446,7 @@ func sessionApply(pid string) {
 		}
 		time.Sleep(5 * time.Second)
 	}
-	zoneLogf("не вдалося застосувати зону за 2 хвилини; спробую знову після перекалібрування станцій")
+	zoneLogf("не вдалося застосувати зону за 2 хвилини; застосуйте її вручну на сторінці «Кімната»")
 }
 
 // ---------- bindings -----------------------------------------------------------------------------
