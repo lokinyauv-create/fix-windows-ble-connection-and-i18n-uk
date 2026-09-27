@@ -1,7 +1,7 @@
 From c274db6ab1cc632ba27739107064662fb9055215 Mon Sep 17 00:00:00 2001
 From: Lina <lokinyauv@gmail.com>
 Date: Mon, 3 Aug 2026 02:30:48 +0200
-Subject: [PATCH 1/2] feat(i18n): add Ukrainian translation
+Subject: [PATCH 1/3] feat(i18n): add Ukrainian translation
 
 The language switcher already had an "ua" entry in its display-name
 map, but no ua.json resource was registered, so it was unreachable.
@@ -99,7 +99,7 @@ index 0000000..5d49d73
 From a7e702f2f99a0e1c0caac0246d967be911b91f7e Mon Sep 17 00:00:00 2001
 From: Lina <lokinyauv@gmail.com>
 Date: Sat, 26 Sep 2026 21:00:00 +0200
-Subject: [PATCH 2/2] feat(i18n): Ukrainian strings for the power buttons and
+Subject: [PATCH 2/3] feat(i18n): Ukrainian strings for the power buttons and
  the Room page
 
 Adds the Ukrainian text for strings introduced by the other mods ("Turn
@@ -147,6 +147,36 @@ index 5d49d73..caeabc9 100644
 +    "Click again to delete": "Натисніть ще раз, щоб видалити",
 +    "Waiting for SteamVR...": "Чекаю на SteamVR..."
  }
+-- 
+2.55.0
+
+
+From 3cf788f2d46e67ab70ef5011c5f779e4e999c1a2 Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Sun, 27 Sep 2026 06:26:01 +0200
+Subject: [PATCH 3/3] fix(i18n): the Auto zone now applies only when SteamVR
+ starts
+
+Matches mod/play-area, which no longer re-applies the zone after base station recalibration.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ frontend/src/localization/locales/ua.json | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/frontend/src/localization/locales/ua.json b/frontend/src/localization/locales/ua.json
+index caeabc9..2e849dd 100644
+--- a/frontend/src/localization/locales/ua.json
++++ b/frontend/src/localization/locales/ua.json
+@@ -63,7 +63,7 @@
+     "Zone saved": "Зону збережено",
+     "Save": "Зберегти",
+     "No saved zones yet": "Збережених зон поки немає",
+-    "Apply automatically when SteamVR starts and after base station recalibration": "Застосовувати при старті SteamVR і після перекалібрування станцій",
++    "Apply automatically when SteamVR starts and after base station recalibration": "Застосовувати автоматично при старті SteamVR",
+     "Auto": "Авто",
+     "Apply now": "Застосувати зараз",
+     "Zone applied": "Зону застосовано",
 -- 
 2.55.0
 
