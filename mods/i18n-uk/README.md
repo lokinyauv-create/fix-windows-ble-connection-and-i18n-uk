@@ -1,7 +1,7 @@
 # mod: i18n-uk — Ukrainian translation
 
 **Branch:** `mod/i18n-uk` · **Base:** upstream `main` · **Depends on:** nothing
-**Platforms:** all · **Commits:** 2 (2026-08-03, 2026-09-26)
+**Platforms:** all · **Commits:** 3 (2026-08-03 … 09-27)
 
 [Українською](README.uk.md) · [All mods](../README.md)
 
