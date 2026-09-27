@@ -117,8 +117,11 @@ The Ukrainian UI is in daily use (all screenshots in this work are the Ukrainian
     documented unfixed path.
 - **Helpers:** `tools/vrchap-io` built from the vendored source (fetching `openvr.h`
   v2.15.6), and `check` returns exit 3 without SteamVR. `tools/room-setup-fix` builds with gcc.
-- **not yet:** re-apply after `CALIBRATED base` hasn't been observed in this build (the
-  standalone vr-zones watcher with the same logic was used on 2026-09-25).
+- **Re-apply after `CALIBRATED base`: removed 2026-09-27.** In the 2026-09-27 session it
+  fired 3–5 s after controllers re-acquired a station, and each time SteamVR logged
+  "Standing origin changed", snapping back the play space the user had raised on purpose
+  (05:11:34, 05:32:56, 05:33:16, 05:34:54, 06:00:34). With the space untouched SteamVR
+  logged "did not change" (05:12:36, 05:12:48), so it never corrected anything.
 
 ### lighthouse-dfu — live (Linux, 2026-09-26)
 - `info` read all 3 stations (Device Information 0x2A26).
@@ -138,5 +141,5 @@ Generated files only. `wails build` passes.
 - Windows was not re-tested for the 2026-09-26 changes (power-state confirmation loop,
   exit wait); `go vet` for Windows passes.
 - macOS: never tested.
-- The play-area retry fix and the recalibration re-apply are waiting for the next SteamVR
-  session.
+- The play-area retry fix, and the removal of the recalibration re-apply, are waiting for
+  the next SteamVR session.
