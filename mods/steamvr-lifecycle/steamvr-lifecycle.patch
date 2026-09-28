@@ -1,7 +1,7 @@
 From 47cbfb26fbe5a9cddb824dce3a8701bba4ecc99a Mon Sep 17 00:00:00 2001
 From: Lina <lokinyauv@gmail.com>
 Date: Tue, 4 Aug 2026 03:13:49 +0200
-Subject: [PATCH 1/5] fix: release base stations on exit instead of leaving
+Subject: [PATCH 1/6] fix: release base stations on exit instead of leaving
  them claimed
 
 App.Shutdown() already disconnected every base station, but nothing
@@ -128,7 +128,7 @@ index c6e68b1..3ca034c 100644
 From ddce0e6ba2d3498f63b31623fe856b9667a9fbb9 Mon Sep 17 00:00:00 2001
 From: Lina <lokinyauv@gmail.com>
 Date: Tue, 4 Aug 2026 03:59:14 +0200
-Subject: [PATCH 2/5] fix: release base stations while sitting in the tray
+Subject: [PATCH 2/6] fix: release base stations while sitting in the tray
 
 With "Allow tray" on, the close button hides the window instead of
 quitting, so the process keeps running - and kept holding every base
@@ -433,7 +433,7 @@ index 80c01d5..7f0a942 100644
 From d6c744e1765fbec8bc58df36d6444e9f5254761b Mon Sep 17 00:00:00 2001
 From: Lina <lokinyauv@gmail.com>
 Date: Mon, 10 Aug 2026 14:56:12 +0200
-Subject: [PATCH 3/5] feat: quit once SteamVR exits and the stations are asleep
+Subject: [PATCH 3/6] feat: quit once SteamVR exits and the stations are asleep
 
 With SteamVR auto-launching the app there is no reason for it to stay
 resident after the session ends - it just sits in the tray holding the
@@ -518,7 +518,7 @@ index 0f18e8c..37459b4 100644
 From ffc2e4ad29edb3ecd600892529c9de688f05a751 Mon Sep 17 00:00:00 2001
 From: Lina <lokinyauv@gmail.com>
 Date: Wed, 12 Aug 2026 07:47:52 +0200
-Subject: [PATCH 4/5] fix: keep the BLE links instead of releasing them while
+Subject: [PATCH 4/6] fix: keep the BLE links instead of releasing them while
  idle in the tray
 
 Releasing the stations mid-life poisons the process. tinygo's Windows
@@ -636,7 +636,7 @@ index 5c7ebe4..dbf9cd2 100644
 From ddfd109eb045ed5f98bd5e31e293f328e38e1bed Mon Sep 17 00:00:00 2001
 From: Lina <lokinyauv@gmail.com>
 Date: Sat, 26 Sep 2026 19:25:00 +0200
-Subject: [PATCH 5/5] fix: wait for pending power commands before releasing the
+Subject: [PATCH 5/6] fix: wait for pending power commands before releasing the
  stations on exit
 
 When SteamVR stops, the sleep commands go out and the app quits right
@@ -683,3 +683,131 @@ index dbf9cd2..5deac03 100644
 -- 
 2.55.0
 
+
+From 4f5ed6c57501cbdff370f988caa8950531819134 Mon Sep 17 00:00:00 2001
+From: Lina <lokinyauv@gmail.com>
+Date: Mon, 28 Sep 2026 07:41:19 +0200
+Subject: [PATCH 6/6] fix: don't treat a SteamVR restart as the end of the
+ session
+
+Steam's "quit all" followed by a relaunch leaves vrserver gone for ~8 s
+(2026-09-28 06:04:37-06:04:45). That was enough to count as a stop: the
+stations were put to sleep and Shutdown() started releasing them. While
+it was still disconnecting, the new session tried to auto-launch us and
+got VRApplicationError_ApplicationAlreadyRunning; the old process then
+woke one station from the new session's wake and exited halfway through,
+leaving the session with 1 of 3 stations and nothing to wake the rest.
+
+- waitForSteamVR only reports a stop once vrserver has been gone for 20 s
+  (steamVRStopGrace), so a quick restart changes nothing.
+- Shutdown() re-checks vrserver after disconnecting and stays up if
+  SteamVR is back, instead of exiting.
+- ChangeBaseStationPowerStatus waits for an in-flight Shutdown to finish
+  or be called off (shutdownMu), so the new session's wake reconnects the
+  stations instead of racing the teardown.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app.go        | 24 ++++++++++++++++++++++++
+ websockets.go | 21 +++++++++++++++++++++
+ 2 files changed, 45 insertions(+)
+
+diff --git a/app.go b/app.go
+index 5deac03..e5ab015 100644
+--- a/app.go
++++ b/app.go
+@@ -10,6 +10,7 @@ import (
+ 	"runtime"
+ 	"slices"
+ 	"strings"
++	"sync"
+ 	"sync/atomic"
+ 	"syscall"
+ 	"time"
+@@ -558,6 +559,10 @@ func ScanCallback(app *App, a *bluetooth.Adapter, sr bluetooth.ScanResult) {
+ func (a *App) ChangeBaseStationPowerStatus(baseStationMac string, status string) string {
+ 	log.Printf("Power command requested: %s -> %s\n", baseStationMac, status)
+ 
++	// Wait out an exit in progress - see shutdownMu.
++	shutdownMu.Lock()
++	shutdownMu.Unlock()
++
+ 	baseStation, found := knownBaseStations.Get(baseStationMac)
+ 
+ 	if !found {
+@@ -638,9 +643,28 @@ func (a *App) IdentitifyBaseStation(baseStationMac string) string {
+ 	return "ok"
+ }
+ 
++// shutdownMu keeps power commands from racing Shutdown: a wake that arrives
++// while the links are being torn down waits until the exit has either happened
++// or been called off, instead of reconnecting a station that is about to be
++// dropped (or getting killed halfway through by os.Exit).
++var shutdownMu sync.Mutex
++
+ func (a *App) Shutdown() {
++	shutdownMu.Lock()
++	defer shutdownMu.Unlock()
++
+ 	disconnectAllBaseStations()
+ 
++	// Releasing the stations takes several seconds. If SteamVR came back in
++	// the meantime, quitting would leave the new session without us: SteamVR's
++	// auto launch is refused with ApplicationAlreadyRunning while we're still
++	// alive, so nothing wakes the stations. Stay up instead - the new session's
++	// steamvr.status event wakes them through ChangeBaseStationPowerStatus.
++	if running, _ := isProcRunning("vrserver.exe"); running {
++		log.Println("SteamVR is running again, cancelling exit")
++		return
++	}
++
+ 	shutdownSystray()
+ 	os.Exit(0)
+ }
+diff --git a/websockets.go b/websockets.go
+index c792bfe..27f8b0d 100644
+--- a/websockets.go
++++ b/websockets.go
+@@ -41,12 +41,21 @@ func StartHttp() {
+ 
+ }
+ 
++// steamVRStopGrace is how long vrserver has to stay gone before the session
++// counts as over. A SteamVR restart (Steam's "quit all" followed by a relaunch,
++// or the watchdog bringing vrserver back) leaves a gap of several seconds with
++// no vrserver; reporting that as a stop put the stations to sleep and started
++// quitting us just as the new session tried to launch us.
++const steamVRStopGrace = 20 * time.Second
++
+ func waitForSteamVR() {
+ 	go func() {
+ 		if runtime.GOOS == "windows" {
+ 
+ 			log.Println("Started waiting for steamvr")
+ 
++			var missingSince time.Time
++
+ 			for {
+ 
+ 				if config == nil {
+@@ -72,6 +81,18 @@ func waitForSteamVR() {
+ 					break
+ 				}
+ 
++				// Only report a stop once it has lasted - see steamVRStopGrace.
++				if isSteamVRLaunched {
++					missingSince = time.Time{}
++				} else if PREVIOUS_STEAMVR_VALUE {
++					if missingSince.IsZero() {
++						missingSince = time.Now()
++					}
++					if time.Since(missingSince) < steamVRStopGrace {
++						isSteamVRLaunched = true
++					}
++				}
++
+ 				if PREVIOUS_STEAMVR_VALUE != isSteamVRLaunched {
+ 					PREVIOUS_STEAMVR_VALUE = isSteamVRLaunched
+ 					WEBSOCKET_BROADCAST.Broadcast(preparePacket("steamvr.status", map[string]interface{}{
+-- 
+2.55.0
