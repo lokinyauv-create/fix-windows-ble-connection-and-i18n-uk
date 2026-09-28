@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -558,6 +559,10 @@ func ScanCallback(app *App, a *bluetooth.Adapter, sr bluetooth.ScanResult) {
 func (a *App) ChangeBaseStationPowerStatus(baseStationMac string, status string) string {
 	log.Printf("Power command requested: %s -> %s\n", baseStationMac, status)
 
+	// Wait out an exit in progress - see shutdownMu.
+	shutdownMu.Lock()
+	shutdownMu.Unlock()
+
 	baseStation, found := knownBaseStations.Get(baseStationMac)
 
 	if !found {
@@ -638,8 +643,27 @@ func (a *App) IdentitifyBaseStation(baseStationMac string) string {
 	return "ok"
 }
 
+// shutdownMu keeps power commands from racing Shutdown: a wake that arrives
+// while the links are being torn down waits until the exit has either happened
+// or been called off, instead of reconnecting a station that is about to be
+// dropped (or getting killed halfway through by os.Exit).
+var shutdownMu sync.Mutex
+
 func (a *App) Shutdown() {
+	shutdownMu.Lock()
+	defer shutdownMu.Unlock()
+
 	disconnectAllBaseStations()
+
+	// Releasing the stations takes several seconds. If SteamVR came back in
+	// the meantime, quitting would leave the new session without us: SteamVR's
+	// auto launch is refused with ApplicationAlreadyRunning while we're still
+	// alive, so nothing wakes the stations. Stay up instead - the new session's
+	// steamvr.status event wakes them through ChangeBaseStationPowerStatus.
+	if running, _ := isProcRunning("vrserver.exe"); running {
+		log.Println("SteamVR is running again, cancelling exit")
+		return
+	}
 
 	shutdownSystray()
 	os.Exit(0)
