@@ -41,11 +41,20 @@ func StartHttp() {
 
 }
 
+// steamVRStopGrace is how long vrserver has to stay gone before the session
+// counts as over. A SteamVR restart (Steam's "quit all" followed by a relaunch,
+// or the watchdog bringing vrserver back) leaves a gap of several seconds with
+// no vrserver; reporting that as a stop put the stations to sleep and started
+// quitting us just as the new session tried to launch us.
+const steamVRStopGrace = 20 * time.Second
+
 func waitForSteamVR() {
 	go func() {
 		if runtime.GOOS == "windows" || runtime.GOOS == "linux" {
 
 			log.Println("Started waiting for steamvr")
+
+			var missingSince time.Time
 
 			for {
 
@@ -70,6 +79,18 @@ func waitForSteamVR() {
 				if !config.IsSteamVRManaged {
 					STEAMVR_WATCHING = false
 					break
+				}
+
+				// Only report a stop once it has lasted - see steamVRStopGrace.
+				if isSteamVRLaunched {
+					missingSince = time.Time{}
+				} else if PREVIOUS_STEAMVR_VALUE {
+					if missingSince.IsZero() {
+						missingSince = time.Now()
+					}
+					if time.Since(missingSince) < steamVRStopGrace {
+						isSteamVRLaunched = true
+					}
 				}
 
 				if PREVIOUS_STEAMVR_VALUE != isSteamVRLaunched {
